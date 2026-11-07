@@ -52,11 +52,12 @@ inline void NoteFrame(long long frame_us) {
     if (frame_us > 50'000) {
         LOG_INFO(Service,
                  "Hitch: {:.1f} ms frame; GPU thread built {} pipelines in {:.1f} ms, {} queued on "
-                 "demand; {} file reads, {:.1f} MiB, {:.1f} ms",
+                 "demand; {} file reads, {:.1f} MiB, {:.1f} ms; ends at {} ns",
                  static_cast<double>(frame_us) / 1000.0, now_pipelines - pipelines,
                  static_cast<double>(now_pipeline_us - pipeline_us) / 1000.0, now_queued - queued,
                  now_reads - reads, static_cast<double>(now_bytes - bytes) / 1048576.0,
-                 static_cast<double>(now_file_us - file_us) / 1000.0);
+                 static_cast<double>(now_file_us - file_us) / 1000.0,
+                 std::chrono::steady_clock::now().time_since_epoch().count());
     }
     pipelines = now_pipelines;
     pipeline_us = now_pipeline_us;

@@ -9,6 +9,7 @@
 // A copy of the code can be obtained from https://github.com/Ryujinx/Ryujinx
 // The sections using code from Ryujinx are marked with a link to the original version
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -1266,12 +1267,24 @@ UnswizzlePlan PlanUnswizzleImageRows(
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output) {
+    // A run in one contiguous mapping is read in place: copying it out first was ~40% of the GPU
+    // thread's time in a texture-loading hitch (Ocarina of Time, leaving Link's house).
+    // EDEN_NX2_UNSWIZZLE_COPY=1 always copies first.
+    static const bool always_copy = std::getenv("EDEN_NX2_UNSWIZZLE_COPY") != nullptr;
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
-        run.resize(r.guest_bytes);
-        gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+        std::span<const u8> input;
+        if (const u8* const direct = !always_copy && gpu_memory.IsContinuousRange(r.src_addr, r.guest_bytes)
+                                         ? gpu_memory.GetPointer(r.src_addr)
+                                         : nullptr) {
+            input = std::span<const u8>{direct, r.guest_bytes};
+        } else {
+            run.resize(r.guest_bytes);
+            gpu_memory.ReadBlockUnsafe(r.src_addr, run.data(), r.guest_bytes);
+            input = run;
+        }
         Tegra::Texture::UnswizzleTexture(output.subspan(r.host_offset, r.host_bytes),
-                                         run, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
+                                         input, 1U << plan.bpp_log2, r.run_tiles, r.tile_rows, 1,
                                          r.block.height, r.block.depth, r.run_alignment,
                                          gpu_memory.UsesNativeTiling());
     }
