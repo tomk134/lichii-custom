@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include <array>
 #include <thread>
@@ -1854,6 +1855,7 @@ private:
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                Common::Nx2Hitch::NoteFrame(frame);
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
@@ -1873,12 +1875,21 @@ private:
                     static s64 last_tick{};
                     const s64 now_tick = system.CoreTiming().GetClockTicks();
                     std::vector<std::pair<s64, u64>> used;
+                    struct ThreadPlace {
+                        s32 priority;
+                        s32 core;
+                        u64 mask;
+                    };
+                    std::unordered_map<u64, ThreadPlace> places;
                     if (auto* const process = system.ApplicationProcess()) {
                         Kernel::KScopedSchedulerLock sl{kernel};
                         for (auto& thread : process->GetThreadList()) {
                             const s64 time = thread.GetCpuTime();
                             s64& last = last_times[thread.GetThreadId()];
                             used.emplace_back(time - last, thread.GetThreadId());
+                            places[thread.GetThreadId()] = {
+                                thread.GetPriority(), thread.GetActiveCore(),
+                                thread.GetAffinityMask().GetAffinityMask()};
                             last = time;
                         }
                     }
@@ -1893,7 +1904,10 @@ private:
                     for (size_t i = 0; i < (std::min<size_t>)(used.size(), 14); ++i) {
                         auto& slot = Kernel::SchedDiag::For(used[i].second);
                         text += fmt::format(
-                            "\n  t{} cpu {:.0f}% | ready {} us x{:.1f} (max {} us)", used[i].second,
+                            "\n  t{} prio {} core {} mask {:#x} cpu {:.0f}% | ready {} us x{:.1f} "
+                            "(max {} us)",
+                            used[i].second, places[used[i].second].priority,
+                            places[used[i].second].core, places[used[i].second].mask,
                             100.0 * static_cast<double>(used[i].first) / wall,
                             slot.ready_ns.exchange(0) / 600 / 1000,
                             static_cast<double>(slot.ready_count.exchange(0)) / 600.0,

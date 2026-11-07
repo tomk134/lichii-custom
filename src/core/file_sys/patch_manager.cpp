@@ -4,6 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <string>
+#include <vector>
+#include <cstdlib>
 #include <algorithm>
 #include <span>
 #include <array>
@@ -61,7 +67,17 @@ struct BuiltinPatch {
     std::string_view module;
     std::string_view build_id;
     std::span<const BuiltinPatchRecord> records;
+    /// Applied only when this variable is 1 (experiments); null: always.
+    const char* required_env{};
 };
+
+bool BuiltinPatchAllowed(const BuiltinPatch& patch) {
+    if (patch.required_env == nullptr) {
+        return true;
+    }
+    const char* const value = std::getenv(patch.required_env);
+    return value != nullptr && value[0] == '1';
+}
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
 // instead of following the GPU-time controller down to its 480p floor.
@@ -97,7 +113,31 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
 };
 
+// EDEN_NX2_OOT_CHEAP_AUDIO=1 (experiment): the two guest functions that took the most JIT time in
+// Kokiri Forest return at once: 10.7% in a per-sample delay line effect (main+0x370a5a0, an effect
+// plugin's process call, so its buffers pass through dry) and 6.4% in a noise generator
+// (main+0x8ccd80). The sound changes.
+constexpr std::array<u8, 4> RETURN_AT_ONCE{0xC0, 0x03, 0x5F, 0xD6}; // ret
+constexpr std::array CHEAP_AUDIO_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x370A5A0,
+                       .bytes = RETURN_AT_ONCE,
+                       .checked = true,
+                       .original = 0xD503237F}, // pacibsp
+    BuiltinPatchRecord{.module_offset = 0x8CCD80,
+                       .bytes = RETURN_AT_ONCE,
+                       .checked = true,
+                       .original = 0xB981A808}, // ldrsw x8, [x0, #0x1a8]
+};
+
 constexpr std::array BUILTIN_PATCHES{
+    BuiltinPatch{
+        .name = "Cheap audio (experiment)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = CHEAP_AUDIO_RECORDS,
+        .required_env = "EDEN_NX2_OOT_CHEAP_AUDIO",
+    },
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -531,7 +571,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     const auto disabled = GetDisabledAddons();
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || patch.module != name) {
+        if (patch.title_id != title_id || patch.module != name || !BuiltinPatchAllowed(patch)) {
             continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
@@ -663,6 +703,53 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
 }
 
 void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+    // EDEN_NX2_ROMFS_LIST=<file>: lists the game's RomFS (path, size).
+    // EDEN_NX2_ROMFS_COPY=<dir>;<needle>[,<needle>...]: copies the files whose path has a needle.
+    if (const char* const list_path = std::getenv("EDEN_NX2_ROMFS_LIST");
+        list_path != nullptr && type == ContentRecordType::Program && romfs != nullptr) {
+        std::vector<std::string> needles;
+        std::string copy_dir;
+        if (const char* const copy = std::getenv("EDEN_NX2_ROMFS_COPY")) {
+            const std::string text{copy};
+            const size_t split = text.find(';');
+            copy_dir = text.substr(0, split);
+            std::string rest = split == std::string::npos ? "" : text.substr(split + 1);
+            for (size_t comma; (comma = rest.find(',')) != std::string::npos;) {
+                needles.push_back(rest.substr(0, comma));
+                rest.erase(0, comma + 1);
+            }
+            if (!rest.empty()) {
+                needles.push_back(rest);
+            }
+        }
+        if (const auto tree = ExtractRomFS(romfs)) {
+            std::ofstream out{list_path};
+            std::function<void(const VirtualDir&, const std::string&)> walk;
+            walk = [&](const VirtualDir& dir, const std::string& prefix) {
+                for (const auto& file : dir->GetFiles()) {
+                    const std::string path = prefix + file->GetName();
+                    out << path << ' ' << file->GetSize() << '\n';
+                    for (const auto& needle : needles) {
+                        if (path.find(needle) != std::string::npos) {
+                            const std::filesystem::path target =
+                                std::filesystem::path{copy_dir} / path;
+                            std::error_code error;
+                            std::filesystem::create_directories(target.parent_path(), error);
+                            const auto data = file->ReadAllBytes();
+                            std::ofstream copied{target, std::ios::binary};
+                            copied.write(reinterpret_cast<const char*>(data.data()),
+                                         static_cast<std::streamsize>(data.size()));
+                            break;
+                        }
+                    }
+                }
+                for (const auto& sub : dir->GetSubdirectories()) {
+                    walk(sub, prefix + sub->GetName() + "/");
+                }
+            };
+            walk(tree, "");
+        }
+    }
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
     if ((type != ContentRecordType::Program && type != ContentRecordType::Data &&
@@ -1140,7 +1227,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id) {
+        if (patch.title_id != title_id || !BuiltinPatchAllowed(patch)) {
             continue;
         }
         const auto patch_disabled =

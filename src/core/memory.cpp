@@ -904,14 +904,18 @@ struct Memory::Impl {
             });
             return;
         }
-        auto& current_area = rasterizer_read_areas[core];
         if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
             read_area_generations[core] != generation) {
-            current_area = {};
+            rasterizer_read_areas[core] = {};
+            rasterizer_read_area_sets[core] = {};
             read_area_generations[core] = generation;
         }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
+            auto& current_area =
+                MemAreasEnabled()
+                    ? rasterizer_read_area_sets[core][(address >> YUZU_PAGEBITS) % MemAreaWays]
+                    : rasterizer_read_areas[core];
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
                 return;
@@ -944,8 +948,13 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            auto& current_area = rasterizer_write_areas[core];
+            // EDEN_NX2_MEM_AREAS=1 (experiment, no measured gain): pages kept per core, not only the last one. A game
+            // that alternates between pages asked the buffer cache on every switch, waiting for
+            // the lock the GPU thread holds through each draw.
             PAddr subaddress = address >> YUZU_PAGEBITS;
+            auto& current_area =
+                MemAreasEnabled() ? rasterizer_write_area_sets[core][subaddress % MemAreaWays]
+                                  : rasterizer_write_areas[core];
             // Performance note:
             // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
             // It is often the case the games like to access wildly different addresses. Hence why I propose
@@ -967,6 +976,16 @@ struct Memory::Impl {
     struct GPUDirtyState {
         PAddr last_address;
     };
+
+    static constexpr size_t MemAreaWays = 64;
+
+    static bool MemAreasEnabled() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_MEM_AREAS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
 
     void InvalidateGPUMemory(u8* p, size_t size) {
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -1000,6 +1019,11 @@ struct Memory::Impl {
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
+    std::array<std::array<GPUDirtyState, MemAreaWays>, Core::Hardware::NUM_CPU_CORES>
+        rasterizer_write_area_sets{};
+    std::array<std::array<VideoCore::RasterizerDownloadArea, MemAreaWays>,
+               Core::Hardware::NUM_CPU_CORES>
+        rasterizer_read_area_sets{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;

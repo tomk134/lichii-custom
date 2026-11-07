@@ -74,7 +74,7 @@ public:
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
     const bool m_debugger_enabled{};
-    const bool m_check_memory_access{};
+    bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;
 };
 

@@ -17,6 +17,7 @@
 #include "common/fs/path_util.h"
 #include "common/scope_exit.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_sampler.h"
 #include "common/nx2_timeline.h"
 #include "common/scm_rev.h"
@@ -204,6 +205,30 @@ json Status(ToolState& state, const json& params) {
         {"dump_dir", state.dump_directory.generic_string()},
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
+    };
+}
+
+// Totals since boot: poll it and take differences. The pipeline fields count the current session.
+json PipelineStats(ToolState&, const json&) {
+    namespace Hitch = Common::Nx2Hitch;
+    const auto load = [](const std::atomic<u64>& value) {
+        return value.load(std::memory_order_relaxed);
+    };
+    const u64 queued = load(Hitch::g_on_demand_queued);
+    const u64 built = load(Hitch::g_on_demand_built);
+    const u64 failed = load(Hitch::g_on_demand_failed);
+    return {
+        {"gpu_thread_pipelines", load(Hitch::g_pipelines)},
+        {"gpu_thread_ms", static_cast<double>(load(Hitch::g_pipeline_us)) / 1000.0},
+        {"on_demand_queued", queued},
+        {"on_demand_built", built},
+        {"on_demand_failed", failed},
+        {"on_demand_waiting", queued - (std::min)(queued, built + failed)},
+        {"on_demand_worker_ms", static_cast<double>(load(Hitch::g_on_demand_us)) / 1000.0},
+        {"draws_without_pipeline", load(Hitch::g_draws_without_pipeline)},
+        {"file_reads", load(Hitch::g_file_reads)},
+        {"file_mib", static_cast<double>(load(Hitch::g_file_bytes)) / 1048576.0},
+        {"file_ms", static_cast<double>(load(Hitch::g_file_us)) / 1000.0},
     };
 }
 
@@ -631,6 +656,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     };
     return {
         {"status", handler(Status)},
+        {"pipeline_stats", handler(PipelineStats)},
         {"screenshot", handler(Screenshot)},
         {"log_tail", handler(LogTail)},
         {"log_filter", handler(LogFilter)},

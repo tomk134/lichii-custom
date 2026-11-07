@@ -51,6 +51,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "common/nx2_hitch.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
@@ -73,6 +74,21 @@
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
+
+namespace {
+// EDEN_NX2_OQ_FAKE=1 (experiment, from ocarina-recomp's OOT_OQ_FAKE): occlusion reports say
+// "visible" at once, with no host query and no wait for one. The value grows only over a draw, so
+// a report used as a zero reference stays where it was. Back thread only.
+bool OqFake() {
+    static const bool fake = [] {
+        const char* const value = std::getenv("EDEN_NX2_OQ_FAKE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return fake;
+}
+bool g_oq_fake_drew{};
+u64 g_oq_fake_samples{};
+} // Anonymous namespace
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
@@ -698,6 +714,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     GraphicsPipeline* const verify_pipeline = FastDraw::g_verify ? std::exchange(take.pipeline, nullptr) : nullptr;
     GraphicsPipeline* const pipeline{take.pipeline ? take.pipeline : [&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
+        pipeline_cache.NoteRenderTarget();
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline &&
@@ -707,6 +724,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
     }
     if (!pipeline) {
+        Common::Nx2Hitch::g_draws_without_pipeline.fetch_add(1, std::memory_order_relaxed);
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         return;
@@ -846,7 +864,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !OqFake() && maxwell3d->regs.zpass_pixel_count_enable);
     const std::optional<u32> probe =
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
     {
@@ -1017,6 +1036,19 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    g_oq_fake_drew = true;
+    // EDEN_NX2_DRAW_KEEP=<percent> (measurement): drop the other draws, for the frame rate with
+    // less host work per draw. The picture breaks.
+    static const int draw_keep = [] {
+        const char* const value = std::getenv("EDEN_NX2_DRAW_KEEP");
+        return value != nullptr ? std::atoi(value) : 100;
+    }();
+    if (draw_keep < 100) {
+        static u32 draw_counter{};
+        if (++draw_counter % 100 >= static_cast<u32>(draw_keep)) {
+            return;
+        }
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
     // Draws that need the count here (the indirect reset, quads, a first vertex) read the words,
@@ -1569,7 +1601,8 @@ void RasterizerVulkan::DrawTexture() {
     UpdateDynamicStates();
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !OqFake() && maxwell3d->regs.zpass_pixel_count_enable);
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -1749,7 +1782,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // Deferred load-op clears have no render pass yet. Starting a query here
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
-                              !can_defer_clear && regs.zpass_pixel_count_enable);
+                              !OqFake() && !can_defer_clear && regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
@@ -2020,6 +2053,17 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    if (OqFake() && (type == VideoCommon::QueryType::ZPassPixelCount ||
+                     type == VideoCommon::QueryType::ZPassPixelCount64)) {
+        g_oq_fake_samples += std::exchange(g_oq_fake_drew, false) ? 100000 : 0;
+        if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
+            gpu_memory->Write<u64>(gpu_addr, g_oq_fake_samples);
+            gpu_memory->Write<u64>(gpu_addr + 8, gpu.GetTicks());
+        } else {
+            gpu_memory->Write<u32>(gpu_addr, static_cast<u32>(g_oq_fake_samples));
+        }
+        return;
+    }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 

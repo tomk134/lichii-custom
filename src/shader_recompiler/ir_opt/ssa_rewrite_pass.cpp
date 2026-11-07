@@ -147,7 +147,6 @@ enum class Status {
     PushPhiArgument,
 };
 
-template <typename Type>
 struct ReadState {
     ReadState(IR::Block* block_) : block{block_} {}
     ReadState() = default;
@@ -164,16 +163,21 @@ class Pass {
 public:
     template <typename Type>
     void WriteVariable(Type variable, IR::Block* block, const IR::Value& value) {
-        current_def.SetDef(block, variable, value);
+        // Avoid growing Identity chains on register copies; unresolved Phi endpoints stay live.
+        current_def.SetDef(block, variable, value.Resolve());
     }
 
     template <typename Type>
     IR::Value ReadVariable(Type variable, IR::Block* root_block) {
-        // TODO: Windows commits sodoku if you use small_vector
-        std::vector<ReadState<Type>> stack{
-            ReadState<Type>(nullptr),
-            ReadState<Type>(root_block),
-        };
+        // Most reads already have a local definition and need no predecessor traversal.
+        if (const IR::Value& def = current_def.Def(root_block, variable); !def.IsEmpty()) {
+            return def;
+        }
+        // ReadVariable never re-enters while traversing predecessors, so retain its capacity.
+        auto& stack = read_stack;
+        stack.clear();
+        stack.emplace_back(nullptr);
+        stack.emplace_back(root_block);
         const auto prepare_phi_operand{[&] {
             if (stack.back().pred_it == stack.back().pred_end) {
                 IR::Inst* const phi{stack.back().phi};
@@ -303,6 +307,7 @@ private:
     // TODO: Windows dies with stack exhaustion?
     std::unordered_map<IR::Block*, std::map<Variant, IR::Inst*>> incomplete_phis;
     DefTable current_def;
+    std::vector<ReadState> read_stack;
 };
 
 void VisitInst(Pass& pass, IR::Block* block, IR::Inst& inst) {

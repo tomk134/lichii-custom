@@ -40,6 +40,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
+#include "common/nx2_hitch.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -750,6 +751,18 @@ size_t BackgroundPipelineThreads() {
     return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
 }
 
+// EDEN_NX2_PIPELINE_ON_DEMAND=1: no mass background build (on the user's 25,000 pipeline cache it
+// cost 10-20% of the frame rate for minutes after each boot). A cached pipeline is built on a
+// worker when a draw first asks for it, and the draw is skipped until then. A draw that must not
+// be lost (a full-screen pass, or a target no recent frame drew) builds at once, as before.
+bool PipelinesOnDemand() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_ON_DEMAND");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -1280,7 +1293,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
-            if (BackgroundPipelinesEnabled()) {
+            if (BackgroundPipelinesEnabled() || PipelinesOnDemand()) {
                 deferred_graphics.emplace_back(key, std::move(envs));
             }
             return;
@@ -1323,6 +1336,19 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+
+    if (PipelinesOnDemand() && !stop_loading.stop_requested()) {
+        LOG_INFO(Render_Vulkan, "{} cached graphics pipelines are built on demand on workers",
+                 deferred_graphics.size());
+        on_demand_envs.reserve(deferred_graphics.size());
+        for (auto& deferred : deferred_graphics) {
+            on_demand_envs.emplace(deferred.first, std::make_shared<std::vector<FileEnvironment>>(
+                                                       std::move(deferred.second)));
+        }
+        deferred_graphics.clear();
+        on_demand_workers.reset(new Common::ThreadWorker(3, "VkPipelineOnDemand", {},
+                                                         Common::ThreadPlacement::Background));
+    }
 
     if (!deferred_graphics.empty() && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
@@ -1478,6 +1504,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
         pipeline = TakeBackgroundPipeline(graphics_key);
+        if (!pipeline && SkipForOnDemandBuild(graphics_key)) {
+            graphics_cache.erase(pair);
+            return nullptr;
+        }
         if (!pipeline) {
             pipeline = CreateGraphicsPipeline();
         }
@@ -1538,11 +1568,24 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
+    // ~0.9 GB of driver memory at ~0.45 MB each.
+    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    size_t kept_prebuilt = 0;
     size_t evicted = 0;
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         GraphicsPipeline* const pipeline = it->second.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
+            ++it;
+            continue;
+        }
+        // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
+        // budget: evicting it throws the prebuild away, and the game translates it again on the
+        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
+        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
+        // large cache can't hold their driver memory for the whole session.
+        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+            ++kept_prebuilt;
             ++it;
             continue;
         }
@@ -1580,8 +1623,100 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
     return nullptr;
 }
 
+bool PipelineCache::CanSkipPendingDraw(bool discard_native) const {
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (!CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
+                               maxwell3d->regs.zeta_enable != 0, draw_state.draw_element_count,
+                               draw_state.draw_element_count, discard_native)) {
+        return false;
+    }
+    if (!PipelinesOnDemand()) {
+        return true;
+    }
+    // A one-shot pass (from ocarina-recomp's TOTK_PIPE_SKIP): skipping it would lose its output
+    // for good, so only a target recent frames drew may miss a frame.
+    const auto it = render_target_frames.find(current_render_target);
+    return it != render_target_frames.end() && it->second.previous != 0 &&
+           it->second.previous + 2 >= frame_count;
+}
+
+void PipelineCache::NoteRenderTarget() {
+    const u64 target = maxwell3d->regs.rt[0].Address() ^ (maxwell3d->regs.zeta.Address() << 1);
+    if (target == current_render_target && current_render_target_frame == frame_count) {
+        return;
+    }
+    current_render_target = target;
+    current_render_target_frame = frame_count;
+    if (render_target_frames.size() > 4096) {
+        render_target_frames.clear();
+    }
+    auto& frames = render_target_frames[target];
+    if (frames.last != frame_count) {
+        frames.previous = frames.last;
+        frames.last = frame_count;
+    }
+}
+
+bool PipelineCache::SkipForOnDemandBuild(const GraphicsPipelineCacheKey& key) {
+    if (!on_demand_workers) {
+        return false;
+    }
+    const auto it = on_demand_envs.find(key);
+    if (it == on_demand_envs.end()) {
+        return false;
+    }
+    std::scoped_lock lock{background_mutex};
+    if (on_demand_failed.contains(key)) {
+        return false;
+    }
+    const bool pending = on_demand_pending.contains(key);
+    if (!CanSkipPendingDraw(true)) {
+        if (pending) {
+            background_claimed.insert(key); // Built here now: its worker's copy is dropped
+        }
+        return false;
+    }
+    if (pending) {
+        return true;
+    }
+    on_demand_pending.insert(key);
+    Common::Nx2Hitch::g_on_demand_queued.fetch_add(1, std::memory_order_relaxed);
+    on_demand_workers->QueueWork([this, key, envs = it->second]() mutable {
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        if (!background_stop.load(std::memory_order_relaxed)) {
+            const auto begin = std::chrono::steady_clock::now();
+            ShaderPools pools;
+            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+            for (auto& env : *envs) {
+                env_ptrs.push_back(&env);
+            }
+            pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+            Common::Nx2Hitch::g_on_demand_us.fetch_add(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - begin)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+        std::unique_lock worker_lock{background_mutex};
+        on_demand_pending.erase(key);
+        if (background_claimed.erase(key) != 0) {
+            // The GPU thread has its own copy. A pipeline dropped here was never bound.
+        } else if (pipeline) {
+            background_ready.emplace(key, std::move(pipeline));
+            Common::Nx2Hitch::g_on_demand_built.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            on_demand_failed.insert(key);
+            Common::Nx2Hitch::g_on_demand_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+        worker_lock.unlock();
+        pipeline.reset();
+    });
+    return true;
+}
+
 void PipelineCache::StopBackgroundPipelines() {
     background_stop.store(true, std::memory_order_relaxed);
+    on_demand_workers.reset();
     // Joins the threads: a build in progress finishes, queued ones are dropped.
     background_workers.reset();
 }
@@ -1604,11 +1739,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
                  enabled ? "skip" : "wait for");
         return enabled;
     }();
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool discard = CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
-                                              maxwell3d->regs.zeta_enable != 0,
-                                              draw_state.draw_element_count,
-                                              draw_state.draw_element_count, discard_native);
+    const bool discard = CanSkipPendingDraw(discard_native);
     if (discard) {
         static std::atomic<u64> skipped{};
         if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
@@ -1857,6 +1988,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    Common::Nx2Hitch::g_pipelines.fetch_add(1, std::memory_order_relaxed);
+    Common::Nx2Hitch::g_pipeline_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
+        std::memory_order_relaxed);
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to
     // translate.

@@ -551,7 +551,7 @@ void SetCurrentThreadToPerformanceCores() {
 #endif
 }
 
-void PinCurrentThread(PinnedRole role) {
+void PinCurrentThread(PinnedRole role, int guest_core) {
 #ifdef _WIN32
     // Off with EDEN_NX2_PIN_THREADS=0. On by default with 6 or more physical cores: the split's
     // back did about 8% more draws a second at Lake Hylia (Ryzen 7 7800X3D), its worst window
@@ -599,6 +599,19 @@ void PinCurrentThread(PinnedRole role) {
             mask |= core;
         }
         mask &= ~(front | back);
+        // EDEN_NX2_PIN_GUEST=1: each guest core gets one physical core and only its first logical
+        // processor, so no other thread shares that core's caches and execution units.
+        if (static const bool pin_guest = [] {
+                const char* const value = std::getenv("EDEN_NX2_PIN_GUEST");
+                return value != nullptr && value[0] == '1';
+            }();
+            pin_guest && guest_core >= 0 && cores.size() >= 8) {
+            static constexpr std::array<size_t, 6> guest_cores{0, 3, 4, 5, 6, 7};
+            if (static_cast<size_t>(guest_core) < guest_cores.size()) {
+                const KAFFINITY whole = cores[guest_cores[guest_core]];
+                mask = whole & (~whole + 1);
+            }
+        }
         break;
     }
     if (mask != 0) {

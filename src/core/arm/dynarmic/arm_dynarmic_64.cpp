@@ -342,6 +342,20 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;
     config.tpidr_el0 = &m_cb->m_tpidr_el0;
     config.dczid_el0 = 4;
+    // EDEN_NX2_CPU_RISKY=1 (experiment): no check for accesses that split a page, and the floating
+    // point shortcuts of the Unsafe accuracy on top of the Auto ones.
+    if (static const bool risky = [] {
+            const char* const value = std::getenv("EDEN_NX2_CPU_RISKY");
+            return value != nullptr && value[0] == '1';
+        }();
+        risky) {
+        config.detect_misaligned_access_via_page_table = 0;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = false;
+        config.unsafe_optimizations = true;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+        m_cb->m_check_memory_access = false;
+    }
     config.ctr_el0 = 0x8444c004;
     // 31.25 MHz for Switch 2 titles (Common::WallClock::SetGuestCNTFRQ, set at boot).
     config.cntfrq_el0 = static_cast<u32>(Common::g_wall_clock.GetGuestCNTFRQ());

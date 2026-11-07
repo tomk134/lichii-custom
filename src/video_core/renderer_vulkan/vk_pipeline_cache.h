@@ -126,6 +126,8 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    /// The draw's render targets, for CanSkipPendingDraw.
+    void NoteRenderTarget();
 
     void TickFrame();
 
@@ -167,6 +169,11 @@ private:
     } clean;
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    /// Whether the current draw may be dropped while its pipeline is built.
+    [[nodiscard]] bool CanSkipPendingDraw(bool discard_native) const;
+    /// EDEN_NX2_PIPELINE_ON_DEMAND: queues the cached pipeline `key` on a worker; true to skip the
+    /// draw meanwhile, false to build it now.
+    bool SkipForOnDemandBuild(const GraphicsPipelineCacheKey& key);
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -256,6 +263,18 @@ private:
     /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
     std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key);
     void StopBackgroundPipelines();
+    struct RenderTargetFrames {
+        u64 last{};
+        u64 previous{};
+    };
+    std::unordered_map<u64, RenderTargetFrames> render_target_frames;
+    u64 current_render_target{};
+    u64 current_render_target_frame{};
+    /// Cached pipelines not built at boot, with what a worker needs to build them.
+    std::unordered_map<GraphicsPipelineCacheKey, std::shared_ptr<std::vector<VideoCommon::FileEnvironment>>>
+        on_demand_envs;
+    std::unordered_set<GraphicsPipelineCacheKey> on_demand_pending; ///< Under background_mutex
+    std::unordered_set<GraphicsPipelineCacheKey> on_demand_failed;  ///< Under background_mutex
     std::mutex background_mutex;
     /// Built and not yet asked for by a draw.
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;
@@ -268,6 +287,7 @@ private:
     std::chrono::steady_clock::time_point background_start{};
     /// Last: destroyed (its threads joined) before the state above.
     std::unique_ptr<Common::ThreadWorker> background_workers;
+    std::unique_ptr<Common::ThreadWorker> on_demand_workers;
 };
 
 } // namespace Vulkan
