@@ -1,26 +1,61 @@
-# Lichii — personal build for one PC (Ocarina of Time)
+# Lichii custom (Ocarina of Time performance build)
 
-This is a personal fork of [Lichii](https://github.com/zortos293/Lichii) (itself based on Eglantine, Eden, yuzu and Sudachi), with changes made for exactly one machine and one game: *The Legend of Zelda: Ocarina of Time* on Switch 2.
+A performance build of [Lichii](https://github.com/zortos293/Lichii) for The Legend of Zelda: Ocarina of
+Time on Switch 2 (`0400486024DEC000`), on top of the [Frizti v3](https://github.com/Frizti/Lichii) fork.
+The upstream README is in [README.upstream.md](README.upstream.md).
 
-**It is built for this PC and this PC only. It may not work for anyone else, and there is no support.**
+> [!IMPORTANT]
+> No game files, keys or firmware are included. You need your own dump of the game and your own keys.
+> Tested on one PC only (Ryzen 7 9800X3D, RTX 5070 Ti, Windows 11). It tries to work everywhere, but
+> AMD and Intel GPUs and slower CPUs have not been tested. Report problems as issues, with your
+> `eden_log.txt`.
 
-- Windows 11
-- Ryzen 7 9800X3D
-- RTX 5070 Ti 16 GB
-- 32 GB RAM
-- 1440p / 360 Hz
+## Download and play
 
-Everything here is tuned, measured and tested on that hardware alone. Other GPUs, other CPUs, other games and other settings were never tried. Expect crashes, missing graphics or no gain at all elsewhere. Use the official Lichii builds instead.
+1. Download `Lichii-custom-Windows-x64.zip` from the [latest release](../../releases/latest) and unpack it.
+2. If Windows says a DLL is missing, install the
+   [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+3. Run `lichii.exe`. Settings, keys, saves and games from Lichii, Eden or another Frizti build are used
+   as they are (`%APPDATA%\eden`).
+4. When it asks for Ocarina's frame rate, pick **60 FPS** (30 FPS is for slow PCs).
 
-## What is different from upstream Lichii
+The tuned settings are built in; nothing needs to be set by hand.
 
-- Open ports of upstream pull requests that cut texture re-uploads when turning the camera and avoid shader-compile stalls.
-- Several experimental GPU-thread fast paths turned on through `nx2_switches.txt` (see `dist/` and the `EDEN_NX2_*` variables in the source).
-- Extra opt-in diagnostics for the GPU thread split and the guest scheduler.
-- Benchmark-driven changes to the waits between the two GPU threads. Some are kept but left off because they measured neutral.
+## What this build changes
 
-Nothing is cleaned up for general use. The upstream README is in `README.upstream.md`.
+Measured on the PC above, in a scripted run through Kokiri Forest (hidden benchmark, not the window):
+house about 50 -> 66 fps, village 48 -> 54 fps with the camera turning, 42 -> 52 fps standing, on a
+25,000-pipeline shader cache.
 
-## License
+- **Shaders on demand.** The cached pipelines are no longer all rebuilt after every boot (that took
+  about 10 minutes and cost frame rate the whole time). Each one is built by a worker the first time
+  the game needs it, and the draw is skipped until then, unless skipping it would lose a one-time pass.
+- **No 60 fps cap** in Ocarina's 60 FPS mode with the speed limit on.
+- **Occlusion reports answered at once**, without waiting for the GPU.
+- **Fast draw**: draws whose state did not change reuse what the previous draw set up.
+- From upstream: #446 (suspended channels polled every 50 us), #550, #481, #580, #570; and
+  monarchy/Lichii-performance's SSA alias pass (less shader compile work).
+- A hitch recorder: every frame over 50 ms writes a `Hitch:` line in the log with what ran during it.
 
-GPL-3.0-or-later, as upstream. See `LICENSE.txt`.
+## Turning things off
+
+`%APPDATA%\eden\nx2_switches.txt` overrides the built-in settings, one `NAME=VALUE` per line. If
+something looks wrong, try these first:
+
+| Symptom | Line to add |
+|---|---|
+| Objects flicker or pop in | `EDEN_NX2_OQ_FAKE=0` |
+| Objects missing for a moment in new places | `EDEN_NX2_PIPELINE_ON_DEMAND=0` |
+| Broken geometry | `EDEN_NX2_FAST_DRAW=0` |
+| Smoother image, a bit slower | nothing: the game's anti-aliasing is on by default here |
+
+Faster but changes the image: `EDEN_NX2_OOT_NO_AA=1` skips the game's anti-aliasing network.
+
+## Building
+
+As upstream: see [README.upstream.md](README.upstream.md). The release was built with clang-cl, the
+upstream PGO profile and ThinLTO.
+
+## Notes
+
+Shared as is, with no guarantee. Not affiliated with Nintendo.
