@@ -34,7 +34,7 @@ house about 50 -> 66 fps, village 48 -> 54 fps with the camera turning, 42 -> 52
   the game needs it, and the draw is skipped until then, unless skipping it would lose a one-time pass.
 - **No 60 fps cap** in Ocarina's 60 FPS mode with the speed limit on.
 - **Steady lighting**: CPU reads of GPU results wait for the work that writes them, so the auto-exposure no longer jumps (EvilOOT's fix).
-- **Text and menus at 60**: above 60 fps, text boxes and the pause menu are held at 60 so text stays in sync with voices (from @akakevinvro's Unlocked FPS mod for Hookshot).
+- **Text and menus at 60**: above 60 fps, text boxes and the pause menu are held at 60 so text stays in sync with voices (from akakevinvro's Unlocked FPS mod for Hookshot, x.com/akakevinvro).
 - From upstream: #446 (suspended channels polled every 50 us), #550, #481, #580, #570; and
   monarchy/Lichii-performance's SSA alias pass (less shader compile work).
 - A hitch recorder: every frame over 50 ms writes a `Hitch:` line in the log with what ran during it.

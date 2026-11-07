@@ -1957,7 +1957,7 @@ private:
     std::chrono::steady_clock::time_point m_oot_hold_until{};
 
     // Whether Ocarina of Time has a text box or the pause menu open: a byte in an object two
-    // globals of its main module point to (found by @akakevinvro for this game version).
+    // globals of its main module point to (found by akakevinvro for this game version).
     bool OotTextOrMenuOpen() {
         const u64 base = Loader::g_main_module_base.load(std::memory_order_relaxed);
         if (base == 0) {
@@ -2038,7 +2038,7 @@ private:
         const bool unpaced = ocarina && !oot_pace && !Settings::values.oot_30fps.GetValue();
         // Unpaced, a text box or the pause menu still runs per frame: over 60 fps a cutscene's
         // text got ahead of its voice and the menu's Link turned fast. While one is open, and for
-        // 0.5 s after, Ocarina is paced at 60 (from @akakevinvro's Unlocked FPS for Hookshot).
+        // 0.5 s after, Ocarina is paced at 60 (from akakevinvro's Unlocked FPS for Hookshot).
         // EDEN_NX2_OOT_TEXT_HOLD=0 turns it off.
         static const bool text_hold = [] {
             const char* value = std::getenv("EDEN_NX2_OOT_TEXT_HOLD");
