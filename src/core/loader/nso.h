@@ -9,6 +9,7 @@
 #include <array>
 #include <optional>
 #include <type_traits>
+#include <atomic>
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "core/file_sys/patch_manager.h"
@@ -27,6 +28,10 @@ class KProcess;
 }
 
 namespace Loader {
+
+/// Where the application's "main" module was loaded (0 before it is).
+inline std::atomic<u64> g_main_module_base{};
+
 
 struct NSOSegmentHeader {
     u32_le offset;

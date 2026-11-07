@@ -147,11 +147,10 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"EDEN_NX2_LIST_WAIT_SKIP", "1"},     {"EDEN_NX2_PREFLUSH", "1"},
     {"EDEN_NX2_SEM_FAST", "2"},
     // From the tomk134/lichii-custom tests (RTX 5070 Ti, Ryzen 7 9800X3D): cached pipelines built
-    // on demand instead of all after each boot, occlusion reports answered at once, and the
-    // per-draw skips of the fast draw family.
-    {"EDEN_NX2_PIPELINE_ON_DEMAND", "1"}, {"EDEN_NX2_OQ_FAKE", "1"},
-    {"EDEN_NX2_FAST_DRAW", "2"},          {"EDEN_NX2_BUFFER_SKIP", "1"},
-    {"EDEN_NX2_DYNAMIC_SKIP", "1"},       {"EDEN_NX2_INLINE_INVALIDATE", "1"},
+    // on demand instead of all after each boot. CPU reads of GPU results wait for the work that
+    // writes them (EvilOOT: the auto-exposure stops jumping). The occlusion fake and the fast
+    // draw skips stay off: missing textures and lighting problems in play.
+    {"EDEN_NX2_PIPELINE_ON_DEMAND", "1"}, {"EDEN_NX2_URGENT_READS", "0"},
     {"EDEN_NX2_HANDLE_PTR_CACHE", "1"},
     {"EDEN_NX2_PERF_ON", "frames_ahead,clean_words,index_rebind,submit_budget,fence_flush,"
                          "fragment_barrier,front_sleep,async_pipelines"},

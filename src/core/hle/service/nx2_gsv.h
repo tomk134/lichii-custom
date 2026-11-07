@@ -34,6 +34,7 @@
 #include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "core/loader/nso.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
@@ -1953,6 +1954,29 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
+    std::chrono::steady_clock::time_point m_oot_hold_until{};
+
+    // Whether Ocarina of Time has a text box or the pause menu open: a byte in an object two
+    // globals of its main module point to (found by @akakevinvro for this game version).
+    bool OotTextOrMenuOpen() {
+        const u64 base = Loader::g_main_module_base.load(std::memory_order_relaxed);
+        if (base == 0) {
+            return false;
+        }
+        auto& memory = system.ApplicationMemory();
+        static constexpr std::array<std::pair<u64, u64>, 2> flags{{{0x4e1fcc0, 0xd0}, {0x4e97e38, 0x3a}}};
+        for (const auto& [global, offset] : flags) {
+            if (!memory.IsValidVirtualAddress(base + global)) {
+                continue;
+            }
+            const u64 object = memory.Read64(base + global);
+            if (object >= 0x1000000000ULL && object < 0x2000000000ULL &&
+                memory.IsValidVirtualAddress(object + offset) && memory.Read8(object + offset) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
@@ -2012,14 +2036,30 @@ private:
             return value != nullptr && value[0] == '1';
         }();
         const bool unpaced = ocarina && !oot_pace && !Settings::values.oot_30fps.GetValue();
+        // Unpaced, a text box or the pause menu still runs per frame: over 60 fps a cutscene's
+        // text got ahead of its voice and the menu's Link turned fast. While one is open, and for
+        // 0.5 s after, Ocarina is paced at 60 (from @akakevinvro's Unlocked FPS for Hookshot).
+        // EDEN_NX2_OOT_TEXT_HOLD=0 turns it off.
+        static const bool text_hold = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_TEXT_HOLD");
+            return value == nullptr || value[0] != '0';
+        }();
+        bool hold_60 = false;
+        if (unpaced && text_hold) {
+            const auto now_hold = std::chrono::steady_clock::now();
+            if (OotTextOrMenuOpen()) {
+                m_oot_hold_until = now_hold + std::chrono::milliseconds{500};
+            }
+            hold_60 = now_hold < m_oot_hold_until;
+        }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (trace) {
             m_frame_trace.interval = swap_interval;
             m_frame_trace.refresh = refresh_rate;
             m_frame_trace.forced = forced_interval;
         }
-        if (unpaced || !Settings::values.use_speed_limit.GetValue() ||
-            Settings::SpeedLimit() == 0) {
+        if (!hold_60 && (unpaced || !Settings::values.use_speed_limit.GetValue() ||
+                         Settings::SpeedLimit() == 0)) {
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2027,8 +2067,10 @@ private:
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
-        auto interval = std::chrono::nanoseconds{
-            100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        auto interval =
+            hold_60 ? std::chrono::nanoseconds{1'000'000'000LL / 60}
+                    : std::chrono::nanoseconds{100'000'000'000LL * swap_interval / refresh_rate /
+                                               Settings::SpeedLimit()};
         // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of
         // display refreshes becomes exactly that many measured refreshes (a "120 Hz" display at
         // 119.98 Hz: 33.3389 ms instead of 33.3333). On the game's own clock its frames drifted

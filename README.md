@@ -33,8 +33,8 @@ house about 50 -> 66 fps, village 48 -> 54 fps with the camera turning, 42 -> 52
   about 10 minutes and cost frame rate the whole time). Each one is built by a worker the first time
   the game needs it, and the draw is skipped until then, unless skipping it would lose a one-time pass.
 - **No 60 fps cap** in Ocarina's 60 FPS mode with the speed limit on.
-- **Occlusion reports answered at once**, without waiting for the GPU.
-- **Fast draw**: draws whose state did not change reuse what the previous draw set up.
+- **Steady lighting**: CPU reads of GPU results wait for the work that writes them, so the auto-exposure no longer jumps (EvilOOT's fix).
+- **Text and menus at 60**: above 60 fps, text boxes and the pause menu are held at 60 so text stays in sync with voices (from @akakevinvro's Unlocked FPS mod for Hookshot).
 - From upstream: #446 (suspended channels polled every 50 us), #550, #481, #580, #570; and
   monarchy/Lichii-performance's SSA alias pass (less shader compile work).
 - A hitch recorder: every frame over 50 ms writes a `Hitch:` line in the log with what ran during it.
@@ -46,10 +46,9 @@ something looks wrong, try these first:
 
 | Symptom | Line to add |
 |---|---|
-| Objects flicker or pop in | `EDEN_NX2_OQ_FAKE=0` |
 | Objects missing for a moment in new places | `EDEN_NX2_PIPELINE_ON_DEMAND=0` |
-| Broken geometry | `EDEN_NX2_FAST_DRAW=0` |
-| Smoother image, a bit slower | nothing: the game's anti-aliasing is on by default here |
+| Lower fps than expected | `EDEN_NX2_URGENT_READS=1` (may bring back brightness jumps) |
+| Text or menus at 60 when you want them unlocked | `EDEN_NX2_OOT_TEXT_HOLD=0` |
 
 Faster but changes the image: `EDEN_NX2_OOT_NO_AA=1` skips the game's anti-aliasing network.
 
