@@ -121,6 +121,10 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
+    bool AnyVertexRepacked() const {
+        return vertex_repack_mask != 0;
+    }
+
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
@@ -128,7 +132,8 @@ public:
     void Wait(u64 tick);
 
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
-    void WaitSubmittedTick(u64 tick);
+    void WaitSubmittedTick(u64 tick, u64 writer = 0);
+    void WaitSubmittedTickImpl(u64 tick);
 
     void Finish();
 

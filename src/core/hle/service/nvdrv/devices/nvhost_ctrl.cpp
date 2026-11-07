@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include <fmt/ranges.h>
+#include "common/nx2_timeline.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -90,6 +91,7 @@ NvResult nvhost_ctrl::NvOsGetConfigU32(IocGetConfigParams& params) {
 }
 
 NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_allocation) {
+    Common::Nx2Timeline::Span timeline_span{"guest: GPU event wait"};
     LOG_DEBUG(Service_NVDRV, "syncpt_id={}, threshold={}, timeout={}, is_allocation={}",
               params.fence.id, params.fence.value, params.timeout, is_allocation);
 

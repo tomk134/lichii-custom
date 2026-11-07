@@ -544,6 +544,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         }
 
         if (!lp.filepath.empty()) {
+            launched_with_game = true;
             BootGame(QString::fromStdString(lp.filepath), ApplicationAppletParameters());
         } else if (lp.launch_setup) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::Starter), std::nullopt);
@@ -558,6 +559,31 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
     }
+
+    // The first launch asks for Ocarina of Time's frame rate (not when started with a game,
+    // e.g. from a shortcut or script: that keeps the 60 FPS default until the next plain launch).
+    if (!launched_with_game && !Settings::values.oot_fps_asked.GetValue()) {
+        QTimer::singleShot(0, this, &MainWindow::AskOotFrameRate);
+    }
+}
+
+void MainWindow::AskOotFrameRate() {
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Ocarina of Time frame rate"));
+    box.setIcon(QMessageBox::Question);
+    box.setText(tr("Which frame rate should Ocarina of Time run at?"));
+    box.setInformativeText(
+        tr("60 FPS needs a fast, recent CPU.\n"
+           "30 FPS is for lower-end PCs. The game keeps its normal speed either way.\n\n"
+           "Switch any time with the 60 FPS / 30 FPS button at the bottom of the window."));
+    QPushButton* const fps60 = box.addButton(tr("60 FPS"), QMessageBox::AcceptRole);
+    QPushButton* const fps30 = box.addButton(tr("30 FPS (lower-end PCs)"), QMessageBox::AcceptRole);
+    box.setDefaultButton(fps60);
+    box.exec();
+    Settings::values.oot_30fps.SetValue(box.clickedButton() == fps30);
+    Settings::values.oot_fps_asked.SetValue(true);
+    UpdateOotFpsButton();
+    config->SaveAllValues();
 }
 
 MainWindow::~MainWindow() {
@@ -1196,6 +1222,17 @@ void MainWindow::InitializeWidgets() {
                 gpu_accuracy_button->repaint();
             });
     statusBar()->insertPermanentWidget(0, gpu_accuracy_button);
+
+    // Ocarina of Time frame rate: one click switches 60 / 30 FPS, at once (also in game).
+    oot_fps_button = new QPushButton();
+    oot_fps_button->setObjectName(QStringLiteral("OotFpsStatusBarButton"));
+    oot_fps_button->setCheckable(true);
+    oot_fps_button->setFocusPolicy(Qt::NoFocus);
+    oot_fps_button->setToolTip(tr("Ocarina of Time frame rate. Click to switch between 60 FPS and "
+                                  "30 FPS (lower-end PCs); it takes effect at once."));
+    connect(oot_fps_button, &QPushButton::clicked, this, &MainWindow::OnToggleOotFrameRate);
+    UpdateOotFpsButton();
+    statusBar()->insertPermanentWidget(0, oot_fps_button);
 
     // Setup Renderer API button
     renderer_status_button = new QPushButton();
@@ -4718,6 +4755,19 @@ void MainWindow::UpdateGPUAccuracyButton() {
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
 
+void MainWindow::UpdateOotFpsButton() {
+    const bool fps30 = Settings::values.oot_30fps.GetValue();
+    oot_fps_button->setChecked(fps30);
+    oot_fps_button->setText(fps30 ? tr("30 FPS") : tr("60 FPS"));
+}
+
+void MainWindow::OnToggleOotFrameRate() {
+    Settings::values.oot_30fps.SetValue(!Settings::values.oot_30fps.GetValue());
+    Settings::values.oot_fps_asked.SetValue(true);
+    UpdateOotFpsButton();
+    config->SaveAllValues();
+}
+
 void MainWindow::UpdateDockedButton() {
     const auto console_mode = Settings::values.use_docked_mode.GetValue();
     dock_status_button->setChecked(Settings::IsDockedMode());
@@ -4784,6 +4834,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateAPIText();
     UpdateGPUAccuracyButton();
     UpdateDockedButton();
+    UpdateOotFpsButton();
     UpdateFilterText();
     UpdateAAText();
     UpdateVolumeUI();

@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -17,6 +20,73 @@
 /// them at the end of each presented frame, so every cache they touch is used from its owner.
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
+
+/// EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
+/// debug server's `switch` method, so one session can A/B it.
+[[nodiscard]] inline int EnvSwitch(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? 0 : std::atoi(value); // whole number: EDEN_NX2_DMA_SNAPSHOT=10
+}
+/// The switch's value, read from the environment on first use (-1: not read yet). Static
+/// initialization ran before the frontend applied nx2_switches.txt, so those settings were lost.
+[[nodiscard]] inline int SwitchValue(std::atomic<int>& value, const char* name,
+                                    int fallback = 0) {
+    int current = value.load(std::memory_order_relaxed);
+    if (current < 0) [[unlikely]] {
+        int unset = -1;
+        const int initial = std::getenv(name) != nullptr ? EnvSwitch(name) : fallback;
+        value.compare_exchange_strong(unset, initial, std::memory_order_relaxed);
+        current = value.load(std::memory_order_relaxed);
+    }
+    return current;
+}
+inline std::atomic<int> g_dma_wait_writers{-1};
+/// EXPERIMENT, off by default: Ocarina of Time flickers white on the bottom half of Link's house
+/// ladder with it (confirmed toggling it live, 2026-11-06), for +1.4 fps. EDEN_NX2_SEM_FAST=1,
+/// semaphore acquires without draining the back
+/// when the value is already met and no queued write overlaps it (puller.cpp).
+inline std::atomic<int> g_sem_fast{-1};
+/// EXPERIMENT (not for nx2): EDEN_NX2_LIST_FAST=1, command list entries skip the wait for queued
+/// compute and copies while no page was newly GPU-written for 2 s; =2 also checks each skipped
+/// entry on the back and logs misses (dma_pusher.cpp).
+inline std::atomic<int> g_list_fast{-1};
+/// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1, the split's front does not send the instance
+/// loop writes the back would ignore (draw.end in an instance loop, unchanged vertex and index
+/// buffer firsts and counts) (maxwell_3d.cpp).
+inline std::atomic<int> g_loop_skip{-1};
+
+/// EDEN_NX2_DMA_SNAPSHOT (from EvilOOT's dma-snapshot fix): macro DMA reads of pages a drained
+/// read flushed whole skip the drain while nothing sent since may write them (Maxwell3D::
+/// FrontDmaRead). 9 = on (default: Lake Hylia 46.5 -> 52.3 fps; verify 0 differences in 235k
+/// reads), 10 = on and verify every skipped read against the drained path, 0 = off.
+inline std::atomic<int> g_dma_snapshot{-1};
+
+/// EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
+/// measure how long each frame was shown.
+inline std::atomic<int> g_host_pace{-1};
+
+/// The live switch called `name`, or null.
+[[nodiscard]] inline std::atomic<int>* FindSwitch(std::string_view name) {
+    if (name == "EDEN_NX2_DMA_WAIT_WRITERS") {
+        return &g_dma_wait_writers;
+    }
+    if (name == "EDEN_NX2_SEM_FAST") {
+        return &g_sem_fast;
+    }
+    if (name == "EDEN_NX2_LIST_FAST") {
+        return &g_list_fast;
+    }
+    if (name == "EDEN_NX2_DMA_SNAPSHOT") {
+        return &g_dma_snapshot;
+    }
+    if (name == "EDEN_NX2_LOOP_SKIP") {
+        return &g_loop_skip;
+    }
+    if (name == "EDEN_NX2_HOST_PACE") {
+        return &g_host_pace;
+    }
+    return nullptr;
+}
 
 struct CaptureRequest {
     u64 id;

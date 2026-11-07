@@ -7,12 +7,16 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <vector>
 #include <boost/container/deque.hpp>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -38,6 +42,8 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     bool storage_capable{};
+    u64 render_tick{};                               ///< Scheduler tick that renders the frame
+    std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
 };
 
 class PresentManager {
@@ -75,6 +81,17 @@ public:
 private:
     void PresentThread(std::stop_token token);
 
+    /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
+    /// `frame` until its target. Returns whether it was held.
+    bool PaceFrame(Frame* frame, std::stop_token token);
+
+    /// Waits for each present id until it is shown (VK_KHR_present_wait).
+    void PresentWaitThread(std::stop_token token);
+
+    void ReportShown(u64 id, std::chrono::steady_clock::time_point shown, bool lost);
+
+    void DrainShown();
+
     void CopyToSwapchain(Frame* frame);
 
     void CopyToSwapchainImpl(Frame* frame);
@@ -109,6 +126,29 @@ private:
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};
+
+    // Host frame pacer, used when the device supports VK_KHR_present_wait (present thread only).
+    struct PendingWait {
+        u64 id;
+        VkSwapchainKHR swapchain;
+        std::chrono::steady_clock::time_point submitted;
+    };
+    struct ShownReport {
+        u64 id;
+        std::chrono::steady_clock::time_point shown;
+        bool lost;
+    };
+    bool present_wait_enabled{};
+    HostPacer pacer;
+    u64 last_present_id{};
+    std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
+    std::mutex wait_queue_mutex;
+    std::condition_variable_any wait_queue_cv;
+    std::deque<PendingWait> wait_queue;
+    std::mutex shown_mutex;
+    std::condition_variable shown_cv;
+    std::vector<ShownReport> shown_reports;
+    std::jthread present_wait_thread;
 };
 
 } // namespace Vulkan

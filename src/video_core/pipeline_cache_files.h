@@ -58,4 +58,41 @@ inline bool AdoptLegacyPipelineCache(const std::filesystem::path& legacy,
     return !error;
 }
 
+/// Copies a cache whose records this build reads, written with another cache version, to
+/// `destination` with this build's version in its header (from zortos293/Lichii#194). The
+/// source is never changed; an existing destination is kept.
+inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
+                                        const std::filesystem::path& destination,
+                                        const std::array<char, 8>& magic, u32 source_version,
+                                        u32 destination_version) {
+    std::error_code error;
+    if (std::filesystem::exists(destination, error) || error ||
+        !PipelineCacheHeaderMatches(source, magic, source_version)) {
+        return false;
+    }
+    auto temporary = destination;
+    temporary += ".migrating";
+    if (!std::filesystem::copy_file(source, temporary,
+                                    std::filesystem::copy_options::overwrite_existing, error)) {
+        return false;
+    }
+    {
+        std::fstream stream(temporary, std::ios::binary | std::ios::in | std::ios::out);
+        stream.seekp(static_cast<std::streamoff>(magic.size()));
+        stream.write(reinterpret_cast<const char*>(&destination_version),
+                     sizeof(destination_version));
+        stream.close();
+        if (stream.fail()) {
+            std::filesystem::remove(temporary, error);
+            return false;
+        }
+    }
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    return true;
+}
+
 } // namespace VideoCommon

@@ -16,8 +16,9 @@
 #include <vector>
 
 #include "common/common_types.h"
-#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+// Before the Vulkan headers: on Linux they pull in X11, whose Success macro breaks NvResult.
 #include "video_core/surface.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {

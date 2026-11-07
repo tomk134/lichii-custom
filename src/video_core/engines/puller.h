@@ -79,6 +79,10 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        /// Polls that found the word current but unmet (CanResumeAcquire).
+        u32 unmet_polls{};
+        /// When the back was last drained for this acquire: registration, then every drained poll.
+        std::chrono::steady_clock::time_point last_drain{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -30,6 +31,7 @@ namespace {
 struct Config {
     unsigned hz{};
     unsigned delay_seconds{};
+    bool delay_until_file{};
     unsigned seconds{20};
     std::vector<std::string> threads;
 };
@@ -41,9 +43,11 @@ unsigned ReadUnsigned(const char* variable, unsigned fallback) {
 
 const Config& GetConfig() {
     static const Config config = [] {
+        const char* const delay = std::getenv("EDEN_NX2_SAMPLE_DELAY");
         Config result{
             .hz = ReadUnsigned("EDEN_NX2_SAMPLE_PROFILE", 0),
             .delay_seconds = ReadUnsigned("EDEN_NX2_SAMPLE_DELAY", 0),
+            .delay_until_file = delay != nullptr && std::string_view{delay} == "file",
             .seconds = ReadUnsigned("EDEN_NX2_SAMPLE_SECONDS", 20),
         };
         const char* const list = std::getenv("EDEN_NX2_SAMPLE_THREADS");
@@ -165,10 +169,23 @@ size_t Walk(CONTEXT& context, std::array<std::uint64_t, MaxDepth>& frames) {
 
 void SamplerMain() {
     const Config& config = GetConfig();
-    Sleep(config.delay_seconds * 1000);
+    const auto log_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
+    if (config.delay_until_file) {
+        const auto trigger = log_dir / "sample.now";
+        std::error_code error;
+        std::filesystem::remove(trigger, error);
+        LOG_INFO(Common, "Sample profile: starts once {} exists", trigger.string());
+        while (!std::filesystem::exists(trigger, error)) {
+            Sleep(250);
+        }
+        std::filesystem::remove(trigger, error);
+        LOG_INFO(Common, "Sample profile: started by {}", trigger.string());
+    } else {
+        Sleep(config.delay_seconds * 1000);
+    }
 
-    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) /
-                      ("nx2_samples_" + std::to_string(GetCurrentProcessId()) + ".bin");
+    const auto path =
+        log_dir / ("nx2_samples_" + std::to_string(GetCurrentProcessId()) + ".bin");
     std::ofstream file{path, std::ios::binary | std::ios::trunc};
     if (!file) {
         LOG_ERROR(Common, "Sample profile: can't open {}", path.string());

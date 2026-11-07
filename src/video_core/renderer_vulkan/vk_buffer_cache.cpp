@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <unordered_map>
 #include <cstring>
 #include <cstdlib>
 #include <span>
@@ -69,7 +71,10 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     if (device.IsExtTransformFeedbackSupported()) {
-        flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+        // The counter usage too: draws can take their vertex count from any buffer
+        // (DrawIndirectByteCountEXT, nx2_indirect_grid.h).
+        flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                 VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     }
     if (device.IsExtConditionalRendering()) {
         flags |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
@@ -171,13 +176,21 @@ public:
     virtual ~QuadIndexBuffer() = default;
 
     void UpdateBuffer(u32 num_indices_) {
+        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
+            retired_buffers.erase(retired_buffers.begin());
+        }
         if (num_indices_ <= num_indices) {
             return;
         }
 
-        scheduler.Finish();
+        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
+        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
+        if (buffer) {
+            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        }
 
-        num_indices = num_indices_;
+        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
+        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
         index_type = IndexTypeFromNumElements(device, num_indices);
 
         const u32 num_quads = GetQuadsNum(num_indices);
@@ -268,6 +281,7 @@ protected:
     StagingBufferPool& staging_pool;
 
     vk::Buffer buffer{};
+    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
     MemoryCommit memory_commit{};
     VkIndexType index_type{};
     u32 num_indices = 0;
@@ -459,7 +473,86 @@ void BufferCacheRuntime::Wait(u64 tick) {
     scheduler.Wait(tick);
 }
 
-void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+namespace {
+// EDEN_NX2_LIST_WAIT_TRACE=1: the front's waits for GPU-written command list copies, per writer
+// (the dispatch's shader hash, 0 for a DMA copy): count, time, and how many submissions the GPU
+// still had to finish when the wait began. Logged every 2 s.
+class ListWaitTrace {
+public:
+    static ListWaitTrace* Get() {
+        static const bool enabled = std::getenv("EDEN_NX2_LIST_WAIT_TRACE") != nullptr;
+        static ListWaitTrace trace;
+        return enabled ? &trace : nullptr;
+    }
+
+    void Note(u64 writer, u64 behind, bool unsubmitted, std::chrono::steady_clock::duration wait) {
+        const u64 us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(wait).count());
+        Entry& entry = entries[writer];
+        ++entry.count;
+        entry.us += us;
+        entry.max_us = (std::max)(entry.max_us, us);
+        entry.behind += behind;
+        entry.unsubmitted += unsubmitted ? 1 : 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds{2}) {
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - last).count();
+        last = now;
+        std::vector<std::pair<u64, Entry>> sorted(entries.begin(), entries.end());
+        std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+        u64 total = 0;
+        u64 count = 0;
+        for (const auto& [key, value] : sorted) {
+            total += value.us;
+            count += value.count;
+        }
+        LOG_INFO(Render_Vulkan, "List waits: {:.1f}/s, {:.2f} ms/s", count / seconds,
+                 total / 1000.0 / seconds);
+        for (size_t i = 0; i < (std::min<size_t>)(sorted.size(), 8); ++i) {
+            const auto& [key, value] = sorted[i];
+            LOG_INFO(Render_Vulkan,
+                     "  writer {:016x}: {:.1f}/s, {:.2f} ms/s, max {} us, {:.1f} submissions "
+                     "behind, {} unsubmitted",
+                     key, value.count / seconds, value.us / 1000.0 / seconds, value.max_us,
+                     static_cast<double>(value.behind) / value.count, value.unsubmitted);
+        }
+        entries.clear();
+    }
+
+private:
+    struct Entry {
+        u64 count{};
+        u64 us{};
+        u64 max_us{};
+        u64 behind{};
+        u64 unsubmitted{};
+    };
+    std::unordered_map<u64, Entry> entries;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+} // Anonymous namespace
+
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
+    auto& master = scheduler.GetMasterSemaphore();
+    if (master.IsFree(tick)) {
+        return;
+    }
+    if (ListWaitTrace* const trace = ListWaitTrace::Get()) [[unlikely]] {
+        master.Refresh();
+        const u64 known = master.KnownGpuTick();
+        const bool unsubmitted = !scheduler.IsSubmitted(tick);
+        const auto start = std::chrono::steady_clock::now();
+        WaitSubmittedTickImpl(tick);
+        trace->Note(writer, tick > known ? tick - known : 0, unsubmitted,
+                    std::chrono::steady_clock::now() - start);
+        return;
+    }
+    WaitSubmittedTickImpl(tick);
+}
+
+void BufferCacheRuntime::WaitSubmittedTickImpl(u64 tick) {
     auto& master = scheduler.GetMasterSemaphore();
     if (master.IsFree(tick)) {
         return;

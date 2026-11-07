@@ -24,6 +24,13 @@ public:
         return {*last_deadline, reset};
     }
 
+    /// Moves the current deadline (and the ones after it) by `shift`.
+    void Shift(std::chrono::nanoseconds shift) {
+        if (last_deadline) {
+            *last_deadline += shift;
+        }
+    }
+
 private:
     std::optional<Clock::time_point> last_deadline;
 };

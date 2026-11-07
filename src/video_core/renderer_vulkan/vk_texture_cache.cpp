@@ -71,8 +71,16 @@ using VideoCore::Surface::SurfaceType;
 namespace {
 constexpr bool ENABLE_MSAA_TILER_RESOLVE = true;
 constexpr bool ENABLE_MSAA_RESOLVE_CONSUME = true;
-constexpr bool ENABLE_MSAA_COLOR_DISCARD = true;
-constexpr bool ENABLE_MSAA_DEPTH_STENCIL_DISCARD = true;
+// EDEN_NX2_MSAA_DISCARD=0: MSAA render passes keep their samples (STORE_OP_STORE) even when they
+// begin with a clear. A discarding pass that something ends early (a copy needs the render pass
+// closed) loses the samples drawn so far, and its resumed half loads garbage.
+bool MsaaDiscardEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MSAA_DISCARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 [[nodiscard]] constexpr bool NeedsExplicitBorderColorFormat(VkFormat format) {
     switch (format) {
@@ -4794,10 +4802,9 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         SupportsDepthStencilResolve(runtime.device, renderpass_key.depth_format);
     renderpass_key.resolve_depth_stencil = do_resolve_depth_stencil;
 
-    discard_msaa_color =
-        ENABLE_MSAA_RESOLVE_CONSUME && ENABLE_MSAA_COLOR_DISCARD && do_resolve_color;
-    discard_msaa_depth_stencil = ENABLE_MSAA_RESOLVE_CONSUME &&
-                                 ENABLE_MSAA_DEPTH_STENCIL_DISCARD && do_resolve_depth_stencil;
+    discard_msaa_color = ENABLE_MSAA_RESOLVE_CONSUME && MsaaDiscardEnabled() && do_resolve_color;
+    discard_msaa_depth_stencil =
+        ENABLE_MSAA_RESOLVE_CONSUME && MsaaDiscardEnabled() && do_resolve_depth_stencil;
 
     renderpass = runtime.render_pass_cache.Get(renderpass_key);
     render_pass_key = renderpass_key;

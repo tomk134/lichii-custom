@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -19,6 +20,7 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
@@ -28,6 +30,7 @@
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/nx2_indirect_grid.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
@@ -329,8 +332,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             LOG_ERROR(HW_GPU, "Unmapped native inline QMD destination");
             return true;
         }
+        // The QMD keeps grid placeholders for DispatchNativeCompute (nx2_indirect_grid.h).
+        Tegra::Nx2IndirectGrid::g_writing_qmd = true;
         rasterizer->AccelerateInlineToMemory(address, 256,
             std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
+        Tegra::Nx2IndirectGrid::g_writing_qmd = false;
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
             native_registers[0xad] = static_cast<u32>(address >> 8);
@@ -575,6 +581,65 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    // A grid of GPU-written placeholders: dispatch indirectly from the words they stand for.
+    bool grid_placeholder = false;
+    if (Tegra::Nx2IndirectGrid::AnyLive()) [[unlikely]] {
+        const u32 x = qmd[12];
+        const u32 y = qmd[13] & 0xffff;
+        const u32 z = qmd[14] & 0xffff;
+        Tegra::Nx2IndirectGrid::LogCounts();
+        if (const auto match = Tegra::Nx2IndirectGrid::MatchX(x)) {
+            const auto [slot, source] = *match;
+            // y and z: the entry's words too, or the constant 1 the macro used instead (the
+            // entry's then hold 1 as well: its sizes are counts of 1D work).
+            const bool y_ok = y == Tegra::Nx2IndirectGrid::Placeholder(slot, 1) || y == 1;
+            const bool z_ok = z == Tegra::Nx2IndirectGrid::Placeholder(slot, 2) || z == 1;
+            static const bool read_back = [] {
+                const char* value = std::getenv("EDEN_NX2_INDIRECT_GRID");
+                return value != nullptr && value[0] == '2';
+            }();
+            if (!y_ok || !z_ok) {
+                Tegra::Nx2IndirectGrid::Get().skipped.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1) < 8) {
+                    LOG_ERROR(HW_GPU, "GPU-sized dispatch {:#x}: y {:#x} z {:#x} unsupported, skipped",
+                              x, y, z);
+                }
+                return true;
+            }
+            if (read_back) {
+                // Debug: wait for the words here and dispatch them directly.
+                memory_manager.FlushRegion(source, 3 * sizeof(u32));
+                std::array<u32, 3> words{};
+                memory_manager.ReadBlock(source, words.data(), sizeof(words));
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1) < 40) {
+                    LOG_INFO(HW_GPU, "GPU-sized dispatch {:#x} from {:#x}: {} {} {} (qmd y {:#x} z {:#x})",
+                             x, source, words[0], words[1], words[2], y, z);
+                }
+                launch_description.grid_dim_x.Assign(words[0]);
+                launch_description.grid_dim_y.Assign(words[1] & 0xffff);
+                launch_description.grid_dim_z.Assign(words[2] & 0xffff);
+            } else {
+                indirect_compute = source;
+            }
+            grid_placeholder = true;
+            Tegra::Nx2IndirectGrid::Get().dispatched.fetch_add(1, std::memory_order_relaxed);
+        } else if (Tegra::Nx2IndirectGrid::LooksLikePlaceholder(x)) {
+            Tegra::Nx2IndirectGrid::Get().skipped.fetch_add(1, std::memory_order_relaxed);
+            // Never dispatch the placeholder itself: ~2 billion workgroups hang the GPU.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 8) {
+                LOG_ERROR(HW_GPU, "GPU-sized dispatch {:#x} lost its source: skipped", x);
+            }
+            return true;
+        }
+    }
+    SCOPE_EXIT {
+        if (grid_placeholder) {
+            indirect_compute = std::nullopt;
+        }
+    };
     dlss_chain.output_pass = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
@@ -1416,10 +1481,27 @@ std::span<u32> KeplerCompute::FrontMacroPositions(FrontState& fs) {
     return native_macro_positions;
 }
 
+namespace {
+// EDEN_NX2_MACRO_TRACE: the compute methods after a traced macro call (direct and macro writes).
+int g_follow_left{};
+std::string g_follow_text;
+void FollowNote(const char* kind, u32 method, u32 value) {
+    if (g_follow_left <= 0) [[likely]] {
+        return;
+    }
+    g_follow_text += fmt::format(" {}{:x}={:x}", kind, method, value);
+    if (--g_follow_left == 0) {
+        LOG_INFO(HW_GPU, "after the traced macro:{}", g_follow_text);
+        g_follow_text.clear();
+    }
+}
+} // Anonymous namespace
+
 void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split,
                                     u32 method, u32 argument, bool is_last_call,
                                     const GPUVAddr* segment) {
     auto& fs = Front(split);
+    FollowNote("", method, argument);
     if (method >= fs.registers.size()) {
         split.Method(this, method, argument, is_last_call, segment);
         return;
@@ -1576,8 +1658,8 @@ void KeplerCompute::FrontSignalQmd(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
             if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) {
                 return false;
             }
-            if (const u8* const word = memory_manager.GetPointer(address); word && !blind) {
-                split.NoteRelease(reinterpret_cast<u64>(word), address, payload,
+            if (const auto device = memory_manager.GpuToCpuAddress(address); device && !blind) {
+                split.NoteRelease(*device, address, payload,
                                   (flags & (1U << 26)) != 0   ? Kind::Add
                                   : (flags & (1U << 19)) != 0 ? Kind::Max
                                                               : Kind::Set);
@@ -1615,8 +1697,8 @@ void KeplerCompute::FrontNoteUploadRelease(VideoCommon::GpuSplit& split, FrontSt
         return;
     }
     const GPUVAddr address = (GPUVAddr{fs.registers[upload + 2]} << 32) | fs.registers[upload + 3];
-    if (const u8* const word = memory_manager.GetPointer(address)) {
-        split.NoteRelease(reinterpret_cast<u64>(word), address, argument);
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        split.NoteRelease(*device, address, argument);
     }
 }
 
@@ -1646,8 +1728,8 @@ void KeplerCompute::FrontNoteQmdReleases(VideoCommon::GpuSplit& split,
             continue;
         }
         const GPUVAddr address = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
-        if (const u8* const word = memory_manager.GetPointer(address)) {
-            split.NoteRelease(reinterpret_cast<u64>(word), address, qmd[base + 2],
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            split.NoteRelease(*device, address, qmd[base + 2],
                               (flags & (1U << 26)) != 0   ? Kind::Add
                               : (flags & (1U << 19)) != 0 ? Kind::Max
                                                           : Kind::Set);
@@ -1663,8 +1745,8 @@ void KeplerCompute::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontSt
     }
     const GPUVAddr address =
         (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
-    if (const u8* const word = memory_manager.GetPointer(address)) {
-        split.NoteRelease(reinterpret_cast<u64>(word), address, fs.registers[0x6c2]);
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        split.NoteRelease(*device, address, fs.registers[0x6c2]);
     }
 }
 
@@ -1742,6 +1824,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         return;
     }
     for (u32 i = 0; i < amount; ++i) {
+        FollowNote("x", method, base_start[i]);
         FrontApply(fs, method, base_start[i]);
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
@@ -1758,6 +1841,21 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
     const u32 start = positions[((*fs.executing_macro - 0xe00) / 2) % positions.size()];
+    // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
+    static const u32 traced = [] {
+        const char* value = std::getenv("EDEN_NX2_MACRO_TRACE");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
+    }();
+    static u32 traced_calls{};
+    const bool trace = traced != 0 && *fs.executing_macro == traced && traced_calls++ < 6;
+    std::string trace_text;
+    if (trace) [[unlikely]] {
+        trace_text = fmt::format("compute macro {:#x} start {:#x} params", traced, start);
+        for (const u32 p : fs.parameters) {
+            trace_text += fmt::format(" {:x}", p);
+        }
+        trace_text += " writes";
+    }
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
     if (native_data_ram) {
@@ -1768,6 +1866,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         return address < fs.registers.size() ? fs.registers[address] : 0U;
     };
     const auto emit = [&](u32 address, u32 value) {
+        if (trace) [[unlikely]] {
+            trace_text += fmt::format(" {:x}={:x}", address, value);
+        }
+        FollowNote("m", address, value);
         if (address >= 0xe00) {
             return false;
         }
@@ -1802,6 +1904,11 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
+    }
+    if (trace) [[unlikely]] {
+        LOG_INFO(HW_GPU, "{}", trace_text);
+        g_follow_left = 260;
+        g_follow_text.clear();
     }
     fs.parameters.clear();
     if (VideoCommon::GpuSplit::ComputeSink() && ComputeFrontVerifyEnabled() &&

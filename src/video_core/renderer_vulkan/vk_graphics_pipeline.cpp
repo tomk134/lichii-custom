@@ -10,6 +10,8 @@
 #include <iostream>
 #include <set>
 #include <span>
+#include <unordered_set>
+#include <unordered_map>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -35,6 +37,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -47,6 +50,78 @@
 
 namespace Vulkan {
 namespace {
+// EDEN_NX2_DRAW_REUSE_PROBE=1: how often a draw's setup (pipeline, texture handles and samplers,
+// constant buffer addresses, vertex streams, render targets) repeats, from frame to frame and
+// from the previous draw of the same pipeline: whether caching it can pay. Logged every 120 frames.
+struct DrawReuseProbe {
+    static bool Enabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_DRAW_REUSE_PROBE") != nullptr;
+        return enabled;
+    }
+    static DrawReuseProbe& Get() {
+        static DrawReuseProbe probe;
+        return probe;
+    }
+    static u64 Mix(u64 hash, u64 value) {
+        hash ^= value + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+    static u64 Bytes(u64 hash, const void* data, size_t size) {
+        const auto* bytes = static_cast<const u8*>(data);
+        for (size_t i = 0; i + 8 <= size; i += 8) {
+            u64 word;
+            std::memcpy(&word, bytes + i, 8);
+            hash = Mix(hash, word);
+        }
+        return hash;
+    }
+    void Note(const void* pipeline, u64 full, u64 textures, u64 no_cbufs) {
+        ++draws;
+        no_cbufs_seen += last_no_cbufs.contains(no_cbufs) ? 1 : 0;
+        auto& previous_no_cbufs = previous_no_cbufs_by_pipeline[pipeline];
+        no_cbufs_same_previous += previous_no_cbufs == no_cbufs ? 1 : 0;
+        previous_no_cbufs = no_cbufs;
+        this_no_cbufs.insert(no_cbufs);
+        full_seen += last_full.contains(full) ? 1 : 0;
+        textures_seen += last_textures.contains(textures) ? 1 : 0;
+        auto& previous = previous_by_pipeline[pipeline];
+        full_same_previous += previous.first == full ? 1 : 0;
+        textures_same_previous += previous.second == textures ? 1 : 0;
+        previous = {full, textures};
+        this_full.insert(full);
+        this_textures.insert(textures);
+    }
+    void Frame() {
+        std::swap(last_full, this_full);
+        std::swap(last_textures, this_textures);
+        std::swap(last_no_cbufs, this_no_cbufs);
+        this_full.clear();
+        this_textures.clear();
+        this_no_cbufs.clear();
+        if (++frames < 120) {
+            return;
+        }
+        const auto pct = [this](u64 n) { return draws ? 100.0 * static_cast<double>(n) / static_cast<double>(draws) : 0.0; };
+        LOG_INFO(Render_Vulkan,
+                 "Draw reuse probe: {:.0f} draws/frame; setup seen last frame {:.1f}%, textures seen "
+                 "last frame {:.1f}%; same as the pipeline's previous draw: setup {:.1f}%, textures "
+                 "{:.1f}%; without constant buffer addresses: seen last frame {:.1f}%, same as "
+                 "previous {:.1f}%",
+                 static_cast<double>(draws) / frames, pct(full_seen), pct(textures_seen),
+                 pct(full_same_previous), pct(textures_same_previous), pct(no_cbufs_seen),
+                 pct(no_cbufs_same_previous));
+        frames = draws = full_seen = textures_seen = full_same_previous = textures_same_previous = 0;
+        no_cbufs_seen = no_cbufs_same_previous = 0;
+    }
+    std::unordered_set<u64> last_full, this_full, last_textures, this_textures;
+    std::unordered_map<const void*, std::pair<u64, u64>> previous_by_pipeline;
+    std::unordered_set<u64> last_no_cbufs, this_no_cbufs;
+    std::unordered_map<const void*, u64> previous_no_cbufs_by_pipeline;
+    u64 no_cbufs_seen{}, no_cbufs_same_previous{};
+    u64 frames{}, draws{}, full_seen{}, textures_seen{}, full_same_previous{},
+        textures_same_previous{};
+};
+
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
@@ -271,6 +346,12 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 } // Anonymous namespace
 
+void NoteDrawReuseProbeFrame() {
+    if (DrawReuseProbe::Enabled()) [[unlikely]] {
+        DrawReuseProbe::Get().Frame();
+    }
+}
+
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
 }
@@ -317,6 +398,54 @@ GraphicsPipeline::GraphicsPipeline(
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
+    writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+        return any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+    const auto block = [&](DeltaBlocker blocker) {
+        if (delta_blocker == DeltaBlocker::None) {
+            delta_blocker = blocker;
+        }
+    };
+    if (writes_images) {
+        block(DeltaBlocker::WritesImages);
+    }
+    if (IsMeshPipeline()) {
+        block(DeltaBlocker::Mesh);
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        u32& handles = handle_constant_buffers[stage];
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            if (desc.handle_program != ~0U) {
+                block(DeltaBlocker::ComputedHandles);
+            }
+            handles |= 1U << desc.cbuf_index;
+            if (desc.has_secondary) {
+                handles |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            if (desc.handle_program != ~0U) {
+                block(DeltaBlocker::ComputedHandles);
+            }
+            handles |= 1U << desc.cbuf_index;
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            if (desc.handle_program != ~0U) {
+                block(DeltaBlocker::ComputedHandles);
+            }
+            handles |= 1U << desc.cbuf_index;
+            if (desc.has_secondary) {
+                handles |= 1U << desc.secondary_cbuf_index;
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            if (desc.handle_program != ~0U) {
+                block(DeltaBlocker::ComputedHandles);
+            }
+            handles |= 1U << desc.cbuf_index;
+        }
+    }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
@@ -552,6 +681,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    if (DrawReuseProbe::Enabled()) [[unlikely]] {
+        u64 textures = 0;
+        for (const auto& view : views) {
+            textures = DrawReuseProbe::Mix(textures, view.index);
+        }
+        for (const auto sampler : samplers) {
+            textures = DrawReuseProbe::Mix(textures, sampler.index);
+        }
+        u64 full = DrawReuseProbe::Mix(textures, reinterpret_cast<u64>(this));
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            for (const auto& cbuf : maxwell3d->state.shader_stages[stage].const_buffers) {
+                full = DrawReuseProbe::Mix(full, cbuf.enabled ? cbuf.address ^ (u64{cbuf.size} << 48) : 0);
+            }
+        }
+        full = DrawReuseProbe::Bytes(full, &regs.vertex_streams, sizeof(regs.vertex_streams));
+        full = DrawReuseProbe::Bytes(full, &regs.rt, sizeof(regs.rt));
+        u64 no_cbufs = DrawReuseProbe::Mix(textures, reinterpret_cast<u64>(this));
+        no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.vertex_streams, sizeof(regs.vertex_streams));
+        no_cbufs = DrawReuseProbe::Bytes(no_cbufs, &regs.rt, sizeof(regs.rt));
+        DrawReuseProbe::Get().Note(this, full, textures, no_cbufs);
+    }
     static const bool record_sampled = [] {
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
@@ -580,6 +730,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 view_index += Shader::NumDescriptors(info.image_descriptors);
             }
         }
+    }
+    if (delta_blocker == DeltaBlocker::None && VideoCommon::Nx2FastDraw::g_delta_enabled) {
+        const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
+                                  const VideoCommon::ImageViewInOut& rhs) {
+            return lhs.index == rhs.index && lhs.id == rhs.id;
+        };
+        if (std::exchange(verify_delta, false)) {
+            delta_mismatch = !delta_views_valid ||
+                             !std::ranges::equal(views, delta_views, same_view) ||
+                             !std::ranges::equal(samplers, delta_samplers);
+        }
+        delta_views.assign(views.begin(), views.end());
+        delta_samplers.assign(samplers.begin(), samplers.end());
+        configured_stages = Spec::enabled_stages;
+        delta_views_valid = true;
     }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
@@ -732,6 +897,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+GraphicsPipeline::DeltaResult GraphicsPipeline::ConfigureDelta() {
+    namespace Profile = VideoCommon::Nx2Profile;
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            const auto& descriptors = stage_infos[stage].storage_buffers_descriptors;
+            if (!configured_stages[stage] || descriptors.empty()) {
+                continue;
+            }
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            size_t ssbo_index{};
+            for (const auto& desc : descriptors) {
+                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                       desc.cbuf_offset, desc.is_written);
+                ++ssbo_index;
+            }
+        }
+    }
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        if (!buffer_cache.UpdateGraphicsStageBuffers()) {
+            return DeltaResult::NeedsFull;
+        }
+    }
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+    const auto& regs{maxwell3d->regs};
+    RescalingPushConstant rescaling;
+    RenderAreaPushConstant render_area;
+    const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!configured_stages[stage]) {
+            continue;
+        }
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            buffer_cache.BindHostStageBuffers(stage);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                 rescaling, samplers_it, views_it);
+        }
+        if (stage_infos[stage].uses_render_area) {
+            render_area.uses_render_area = true;
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+        const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.HasFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
+    }
+    if (IsBuilt() && (!pipeline || build->Failed())) {
+        return DeltaResult::Failed;
+    }
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    return ConfigureDraw(rescaling, render_area) ? DeltaResult::Configured : DeltaResult::Failed;
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,

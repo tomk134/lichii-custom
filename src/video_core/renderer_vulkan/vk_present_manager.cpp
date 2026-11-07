@@ -4,12 +4,18 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <thread>
+
+#include "common/logging.h"
+#include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -162,12 +168,29 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         free_queue.push_back(&frame);
     }
 
+    present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
+    LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
+             present_wait_enabled ? "supported" : "unavailable, frames are not paced");
+    if (present_wait_enabled) {
+        present_wait_thread =
+            std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
+    }
     if (use_present_thread) {
         present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
     }
 }
 
-PresentManager::~PresentManager() = default;
+PresentManager::~PresentManager() {
+    // The present thread uses the pacer and the wait queue: stop it first.
+    if (present_thread.joinable()) {
+        present_thread.request_stop();
+        present_thread.join();
+    }
+    if (present_wait_thread.joinable()) {
+        present_wait_thread.request_stop();
+        present_wait_thread.join();
+    }
+}
 
 Frame* PresentManager::GetRenderFrame() {
 
@@ -189,6 +212,7 @@ Frame* PresentManager::GetRenderFrame() {
 void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
+            frame->queued_at = std::chrono::steady_clock::now();
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();
@@ -336,6 +360,15 @@ void PresentManager::PresentThread(std::stop_token token) {
         // Wait for presentation frames
         frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         if (!token.stop_requested()) {
+            bool held = false;
+            if (present_wait_enabled) {
+                // Only this thread pops the queue: the frame stays at its front, and WaitPresent
+                // keeps waiting while it is held.
+                Frame* const next = present_queue.front();
+                lock.unlock();
+                held = PaceFrame(next, token);
+                lock.lock();
+            }
             // Take the frame and notify anyone waiting
             Frame* frame = present_queue.front();
             present_queue.pop_front();
@@ -345,7 +378,19 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
+            last_present_id = 0;
             CopyToSwapchain(frame);
+            if (present_wait_enabled) {
+                const auto submitted = std::chrono::steady_clock::now();
+                pacer.NoteSubmitted(last_present_id, submitted, held);
+                if (last_present_id != 0) {
+                    {
+                        std::scoped_lock ql{wait_queue_mutex};
+                        wait_queue.push_back({last_present_id, swapchain.Handle(), submitted});
+                    }
+                    wait_queue_cv.notify_one();
+                }
+            }
 
             // Free the frame for reuse
             std::scoped_lock fl{free_mutex};
@@ -355,7 +400,155 @@ void PresentManager::PresentThread(std::stop_token token) {
     }
 }
 
+bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
+    using Clock = std::chrono::steady_clock;
+    pacer.NoteQueued(frame->queued_at);
+    const VkPresentModeKHR mode = swapchain.PresentMode();
+    const bool allowed =
+        (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR ||
+         mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
+        !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
+        Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
+    pacer.Refresh(Clock::now(), allowed);
+    if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
+        // The next target counts from the refresh the previous frame was shown at.
+        Common::Nx2Timeline::Span span{"present: wait until shown"};
+        std::unique_lock sl{shown_mutex};
+        shown_cv.wait_for(sl, std::chrono::milliseconds{50}, [&] {
+            return token.stop_requested() ||
+                   std::any_of(shown_reports.begin(), shown_reports.end(),
+                               [want](const ShownReport& r) { return r.id >= want; });
+        });
+    }
+    DrainShown();
+    if (!pacer.Pacing()) {
+        VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
+        return false;
+    }
+    if (frame->render_tick != 0) {
+        // Hold from when the frame is rendered: a frame the GPU finishes late is presented at
+        // once rather than counted against the lead.
+        Common::Nx2Timeline::Span span{"present: wait for frame render"};
+        scheduler.GetMasterSemaphore().Wait(frame->render_tick);
+    }
+    const auto start = Clock::now();
+    // 30 FPS and below: no hold. Holding a frame for its refresh kept the GPU thread from
+    // getting a frame for the next one, so every frame arrived right after the last was shown
+    // and waited a whole frame (~30 ms of input lag). The game's pacing lines its frames up with
+    // the refreshes instead (g_host_phase_ns).
+    if (VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed) >=
+        25'000'000) {
+        VideoCommon::Nx2Perf::g_host_phase_ns.store(pacer.NsToNextRefresh(start),
+                                                    std::memory_order_relaxed);
+        // Only a short hold, for a frame that would be shown a refresh early (after a late
+        // one): longer ones are what backed the frames up.
+        const auto target = pacer.Target(start);
+        if (target <= start || target - start >= pacer.RefreshPeriod()) {
+            return false;
+        }
+        Common::Nx2Timeline::Span span{"present: host pacing hold"};
+        for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
+            const auto left = target - now;
+            if (left > std::chrono::microseconds{1500}) {
+                std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        pacer.NoteHold(Clock::now() - start);
+        return true;
+    }
+    VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
+    const auto target = pacer.Target(start);
+    if (target <= start) {
+        return false;
+    }
+    Common::Nx2Timeline::Span span{"present: host pacing hold"};
+    for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
+        const auto left = target - now;
+        if (left > std::chrono::microseconds{1500}) {
+            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    pacer.NoteHold(Clock::now() - start);
+    return true;
+}
+
+void PresentManager::PresentWaitThread(std::stop_token token) {
+    Common::SetCurrentThreadName("VulkanPresentWait");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    while (!token.stop_requested()) {
+        {
+            std::unique_lock ql{wait_queue_mutex};
+            wait_queue_cv.wait(ql, token, [this] { return !wait_queue.empty(); });
+            if (token.stop_requested()) {
+                return;
+            }
+        }
+        // Short waits, so a swapchain recreation (which takes present_wait_mutex) never waits
+        // long; the swapchain of a queued id stays alive while the mutex is held.
+        std::unique_lock wl{present_wait_mutex};
+        PendingWait item;
+        {
+            std::scoped_lock ql{wait_queue_mutex};
+            if (wait_queue.empty()) {
+                continue;
+            }
+            item = wait_queue.front();
+        }
+        const VkResult result =
+            device.GetLogical().WaitForPresentKHR(item.swapchain, item.id, 4'000'000);
+        const auto now = std::chrono::steady_clock::now();
+        wl.unlock();
+        if (result == VK_TIMEOUT && now - item.submitted < std::chrono::milliseconds{500}) {
+            continue;
+        }
+        {
+            std::scoped_lock ql{wait_queue_mutex};
+            if (wait_queue.empty() || wait_queue.front().id != item.id) {
+                continue;
+            }
+            wait_queue.pop_front();
+        }
+        ReportShown(item.id, now, result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR);
+    }
+}
+
+void PresentManager::ReportShown(u64 id, std::chrono::steady_clock::time_point shown, bool lost) {
+    {
+        std::scoped_lock sl{shown_mutex};
+        shown_reports.push_back({id, shown, lost});
+    }
+    shown_cv.notify_all();
+}
+
+void PresentManager::DrainShown() {
+    std::vector<ShownReport> reports;
+    {
+        std::scoped_lock sl{shown_mutex};
+        reports.swap(shown_reports);
+    }
+    for (const ShownReport& report : reports) {
+        pacer.NoteShown(report.id, report.shown, report.lost);
+    }
+}
+
 void PresentManager::RecreateSwapchain(Frame* frame) {
+    // Nothing may wait on the old swapchain while it is replaced: its queued ids count as lost.
+    std::unique_lock wl{present_wait_mutex, std::defer_lock};
+    if (present_wait_enabled) {
+        wl.lock();
+        std::deque<PendingWait> dropped;
+        {
+            std::scoped_lock ql{wait_queue_mutex};
+            dropped.swap(wait_queue);
+        }
+        for (const PendingWait& item : dropped) {
+            ReportShown(item.id, std::chrono::steady_clock::now(), true);
+        }
+    }
     swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
     SetImageCount();
 }
@@ -588,7 +781,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    swapchain.Present(render_semaphore);
+    last_present_id = swapchain.Present(render_semaphore);
 }
 
 } // namespace Vulkan

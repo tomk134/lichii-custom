@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
+#include "common/nx2_timeline.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -134,7 +135,7 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 32> counters{}; ///< See Counter
+    std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
     std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
@@ -146,9 +147,40 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
+/// The zones a timeline records without detail: waits, whole draws, dispatches and macros.
+[[nodiscard]] constexpr bool IsCoarse(Zone zone) {
+    switch (zone) {
+    case Zone::Idle:
+    case Zone::PendingSleep:
+    case Zone::ResumePending:
+    case Zone::Push:
+    case Zone::Macro:
+    case Zone::Draw:
+    case Zone::Clear:
+    case Zone::Compute:
+    case Zone::FlushWork:
+    case Zone::TextureUpload:
+    case Zone::Fence:
+    case Zone::SplitDrain:
+    case Zone::SplitWait:
+    case Zone::WriterWait:
+    case Zone::ListSubmitWait:
+    case Zone::ListGpuWait:
+        return true;
+    default:
+        return false;
+    }
+}
+
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_)
+        : zone{zone_}, enabled{Enabled()},
+          timeline{Common::Nx2Timeline::Active() &&
+                   (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
+        if (timeline) {
+            timeline_start = Common::Nx2Timeline::Now();
+        }
         if (!enabled) {
             return;
         }
@@ -158,6 +190,10 @@ public:
     }
 
     ~Scope() {
+        if (timeline) {
+            Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
+                                        Common::Nx2Timeline::Now());
+        }
         if (!enabled) {
             return;
         }
@@ -175,8 +211,10 @@ public:
 private:
     Zone zone;
     bool enabled;
+    bool timeline;
     u64 start{};
     u64 parent_child_ns{};
+    u64 timeline_start{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -205,8 +243,16 @@ enum class Counter : u32 {
     DmaReadsWaitUnknown, ///< Of those, waited for a write the front can't place
     DmaReadsWaitGpu,     ///< waited for all queued GPU work with unknown destinations
     DmaReadsWaitWrite,   ///< waited for a noted write to the words' pages
+    AcquirePolls,   ///< Polls of a waiting acquire (Puller::CanResumeAcquire)
+    AcquirePollsFast, ///< Of AcquirePolls: answered from the word without draining the back
+    SemNoFastPath,    ///< SemaphoreReadableNow false: split off or EDEN_NX2_SEM_FAST=0
+    SemGpuWrittenPage, ///< SemaphoreReadableNow false: the word's page is marked GPU-written
+    SemAsyncPending,  ///< SemaphoreReadableNow false: a counter report or timed release is pending
+    SemWritersWait,   ///< SemaphoreReadableNow false: WaitForWritesTo gave up
+    AcquireNoDrain,   ///< Acquires of a current word not met yet that registered without a drain
     Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) <= 64, "Counter outgrew the counters array");
 static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -381,6 +427,22 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(early) * 1e9 / window,
                             rate(Counter::DmaReadsWaitUnknown), rate(Counter::DmaReadsWaitGpu),
                             rate(Counter::DmaReadsWaitWrite));
+    }
+    {
+        const auto rate = [&](Counter counter) {
+            return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
+        };
+        if (data.counters[static_cast<size_t>(Counter::AcquirePolls)] != 0 ||
+            data.counters[static_cast<size_t>(Counter::AcquireNoDrain)] != 0) {
+            line += fmt::format(" | acquire polls {:.0f} ({:.0f} without a drain), acquires "
+                                "waiting without a drain {:.0f}, semaphore word not readable: no "
+                                "fast path {:.0f}, GPU-written page {:.0f}, report pending {:.0f}, "
+                                "writers {:.0f}",
+                                rate(Counter::AcquirePolls), rate(Counter::AcquirePollsFast),
+                                rate(Counter::AcquireNoDrain), rate(Counter::SemNoFastPath),
+                                rate(Counter::SemGpuWrittenPage), rate(Counter::SemAsyncPending),
+                                rate(Counter::SemWritersWait));
+        }
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {

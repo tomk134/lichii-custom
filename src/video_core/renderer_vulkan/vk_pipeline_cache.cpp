@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -1167,6 +1168,28 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                      error ? fmt::format(" (failed: {})", error.message()) : std::string{});
         }
     }
+    // zortos293/Lichii builds from #194 on (cache version 53) write the same records as this
+    // build under another version number: with no cache of this version, copy theirs and
+    // relabel the copy. Their files stay as they are.
+    if (std::error_code error; !std::filesystem::exists(pipeline_cache_filename, error)) {
+        constexpr u32 ZortosCacheVersion = 53;
+        constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        const auto zortos = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan",
+                                                                    ZortosCacheVersion);
+        if (VideoCommon::CopyCompatiblePipelineCache(zortos, pipeline_cache_filename,
+                                                     PipelineCacheMagic, ZortosCacheVersion,
+                                                     CACHE_VERSION)) {
+            LOG_INFO(Render_Vulkan, "Copied cache version {} pipeline cache {} to {}",
+                     ZortosCacheVersion, Common::FS::PathToUTF8String(zortos),
+                     Common::FS::PathToUTF8String(pipeline_cache_filename));
+            const auto zortos_used = VideoCommon::VersionedPipelineCachePath(
+                base_dir, "vulkan_used", ZortosCacheVersion);
+            if (!std::filesystem::exists(used_pipelines_filename, error) &&
+                std::filesystem::exists(zortos_used, error)) {
+                std::filesystem::copy_file(zortos_used, used_pipelines_filename, error);
+            }
+        }
+    }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
@@ -1310,7 +1333,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_active.store(true, std::memory_order_release);
         background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                           Common::ThreadPlacement::Background));
-        for (auto& deferred : deferred_graphics) {
+        // Newest first: the cache file appends, so the end holds what the latest sessions
+        // found, which the game is likelier to need soon than its oldest entries.
+        for (auto& deferred : std::views::reverse(deferred_graphics)) {
             background_workers->QueueWork([this, key = deferred.first,
                                            envs_ = std::move(deferred.second)]() mutable {
                 bool build = !background_stop.load(std::memory_order_relaxed);
@@ -1499,6 +1524,18 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    // Only while the cache is large: each one evicted is translated again on the GPU thread when
+    // its place is revisited (~10 ms). Ocarina of Time kept ~1,900 of them and evicted 3,400 in
+    // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). 8,000
+    // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
+    static const size_t evict_above = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{8000};
+    }();
+    if (graphics_cache.size() <= evict_above) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
@@ -1556,14 +1593,15 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1: skip native draws whose pipeline is still building instead of
-    // waiting for it (experimental; the draw may be missing for a frame or more).
+    // Native draws whose pipeline is still building are skipped instead of waited for (the
+    // object is missing for a frame or more rather than the game freezing while the driver
+    // compiles). Full-screen passes (no depth, few vertices) still wait, so a lighting or post
+    // pass is never dropped. EDEN_NX2_ASYNC_DISCARD=0 waits for every pipeline.
     static const bool discard_native = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value != nullptr && value[0] == '1';
-        if (enabled) {
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
-        }
+        const bool enabled = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws {} unbuilt pipelines",
+                 enabled ? "skip" : "wait for");
         return enabled;
     }();
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -1571,6 +1609,15 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
                                               maxwell3d->regs.zeta_enable != 0,
                                               draw_state.draw_element_count,
                                               draw_state.draw_element_count, discard_native);
+    if (discard) {
+        static std::atomic<u64> skipped{};
+        if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
+            // Counts lookups, not draws: a draw state can look its pipeline up more than once.
+            LOG_INFO(Render_Vulkan,
+                     "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
+                     skipped.load(std::memory_order_relaxed));
+        }
+    }
     return discard ? nullptr : pipeline;
 }
 

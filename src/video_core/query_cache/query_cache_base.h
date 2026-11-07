@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -63,6 +64,21 @@ public:
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }
 
+    /// EDEN_NX2_INLINE_INVALIDATE: changes whenever a query is cached.
+    [[nodiscard]] u64 PageSerial() const noexcept {
+        return page_serial.load(std::memory_order_acquire);
+    }
+
+    /// The page serial when no cached query is in [addr, addr + size), else 0.
+    [[nodiscard]] u64 CleanSerial(VAddr addr, std::size_t size) {
+        bool touched = false;
+        IterateCache<false>(addr, size, [&touched](QueryLocation) {
+            touched = true;
+            return true;
+        });
+        return touched ? 0 : page_serial.load(std::memory_order_relaxed);
+    }
+
     void FlushRegion(VAddr addr, std::size_t size) {
         if (SemiFlushRegion(addr, size)) {
             RequestGuestHostSync();
@@ -86,6 +102,14 @@ public:
             mask |= 1ULL << (static_cast<u64>(query_type));
         }
         return mask;
+    }
+
+    /// Whether a report in the region is still listed (pending host results, or written and not
+    /// unregistered yet). Only the cache mutex: callable from the split front.
+    [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
+        bool result = false;
+        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
+        return result;
     }
 
     /// Return true when a CPU region is modified from the GPU
@@ -149,10 +173,12 @@ protected:
                 continue;
             }
             auto& contents = it->second;
+            bool matched = false;
             for (auto& query : contents) {
                 if (!in_range(query.first)) {
                     continue;
                 }
+                matched = true;
                 if constexpr (RETURNS_BOOL) {
                     if (func(query.second)) {
                         return;
@@ -161,7 +187,11 @@ protected:
                     func(query.second);
                 }
             }
+            // Only pages with a query in the range: the scan above already found none elsewhere.
             if constexpr (remove_from_cache) {
+                if (!matched) {
+                    continue;
+                }
                 const auto in_range2 = [&](const std::pair<u32, QueryLocation>& pair) {
                     return in_range(pair.first);
                 };
@@ -183,6 +213,7 @@ protected:
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;
+    std::atomic<u64> page_serial{1};
 
     struct QueryCacheBaseImpl;
     friend struct QueryCacheBaseImpl;

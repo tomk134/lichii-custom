@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -83,7 +84,9 @@ inline bool On(Opt opt) {
             }
             return bits;
         };
-        const unsigned default_off = bit(Opt::FramesAhead) | bit(Opt::CleanWords) |
+        // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
+        // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
+        const unsigned default_off = bit(Opt::CleanWords) |
                                      bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
                                      bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
@@ -110,5 +113,19 @@ inline bool Verify() {
     }();
     return verify;
 }
+
+/// The frame period the game asks for (nx2:vi2 present word 12 at the speed limit), 0 while
+/// unknown or unpaced. The host frame pacer (vk_host_pacer.h) never holds frames longer.
+inline std::atomic<long long> g_guest_frame_interval_ns{0};
+
+/// The display's measured refresh period while the host frame pacer runs, else 0. The game's
+/// present pacing (nx2_gsv.h) times its frames to whole multiples of it (genlock).
+inline std::atomic<long long> g_host_refresh_ns{0};
+
+/// At 30 FPS and below the host frame pacer presents frames as soon as they are rendered and
+/// publishes how long before the display's next refresh the last one was ready (ns), or -1
+/// while it isn't pacing that way. The game's present pacing (nx2_gsv.h) moves its frames until
+/// that is ~6 ms: each lands on a refresh with little wait (input lag) and evenly spaced.
+inline std::atomic<long long> g_host_phase_ns{-1};
 
 } // namespace VideoCommon::Nx2Perf

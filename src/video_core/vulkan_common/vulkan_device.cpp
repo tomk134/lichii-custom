@@ -1423,6 +1423,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
 }
 
 void Device::RemoveUnsuitableExtensions() {
+    // VK_KHR_present_id, VK_KHR_present_wait (the host frame pacer, vk_host_pacer.h)
+    extensions.present_id = extensions.present_id && features.present_id.presentId;
+    extensions.present_wait =
+        extensions.present_id && extensions.present_wait && features.present_wait.presentWait;
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_wait, features.present_wait,
+                                       VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    RemoveExtensionFeatureIfUnsuitable(extensions.present_id, features.present_id,
+                                       VK_KHR_PRESENT_ID_EXTENSION_NAME);
+
     // VK_EXT_color_write_enable
     extensions.color_write_enable = features.color_write_enable.colorWriteEnable;
     RemoveExtensionFeatureIfUnsuitable(extensions.color_write_enable, features.color_write_enable,

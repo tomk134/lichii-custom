@@ -19,6 +19,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/oot_network.h"
+#include "video_core/nx2_clean_pages.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -114,11 +115,13 @@ public:
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
+    bool HasCachedReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
@@ -162,6 +165,8 @@ public:
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
+    void AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
+                                      std::span<const u8> memory);
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
 
@@ -175,6 +180,9 @@ public:
                                                             u32 pixel_stride);
 
 private:
+    /// False when no page of the range was ever written by the GPU through the buffer cache.
+    bool MayBeGpuModified(DAddr addr, u64 size);
+
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2
@@ -194,6 +202,9 @@ private:
     void TraceDrawFailure(std::string_view reason);
     /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
     void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
+    bool IsNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// A compute dispatch was recorded since the last barrier for GPU-counted draws.
+    bool compute_since_count_barrier{};
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -202,9 +213,16 @@ private:
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
-    void SubmitNx2ListCopies();
+    void SubmitNx2ListCopies(u64 writer);
 
-    void UpdateDynamicStates();
+    /// EDEN_NX2_DYNAMIC_SKIP: pipeline is the draw's (null: look it up).
+    void UpdateDynamicStates(GraphicsPipeline* pipeline = nullptr);
+    void UpdateFixedDynamicStates(Tegra::Engines::Maxwell3D::Regs& regs,
+                                  Maxwell::PrimitiveTopology topology, bool topology_changed);
+    /// The dirty flags that make UpdateFixedDynamicStates record anything on this device.
+    Tegra::Engines::Maxwell3D::DirtyState::Flags DynamicStateFlags() const;
+    /// EDEN_NX2_INLINE_INVALIDATE
+    void FilteredInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences);
 
     void HandleTransformFeedback();
 
@@ -276,8 +294,6 @@ private:
     FrameDump frame_dump;
     FlashWatch flash_watch;
 
-    vk::Event wfi_event;
-
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
@@ -289,6 +305,93 @@ private:
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
+
+    /// EDEN_NX2_FAST_DRAW: what the last fully resolved draw left bound (nx2_fast_draw.h).
+    struct ReusableDraw {
+        GraphicsPipeline* pipeline{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 serial{};
+        u64 tick{};
+        u64 render_pass{};
+        Maxwell::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    enum class FullDraw : u8 {
+        NoCandidate,
+        Kind,
+        StateChanged,
+        Submitted,
+        RenderPass,
+        IndexBuffers,
+        DeltaPipeline,
+        HandleBind,
+        HandleData,
+        DeltaBuffers,
+        Count,
+    };
+    /// Why a fully resolved draw can't be reused by the next one.
+    enum class Ineligible : u8 {
+        Indirect,
+        Mesh,
+        NotBuilt,
+        WritesImages,
+        TransformFeedback,
+        InlineIndex,
+        Quads,
+        Repacked,
+        NoRenderPass,
+        PipelineNotBound,
+        OffBackThread,
+        Count,
+    };
+    enum class DrawPath : u8 { Full, Reused, Delta, Count };
+    struct FastDrawStats {
+        u64 reused{};
+        u64 delta{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
+        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
+        /// PrepareDraw time and draws per path.
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// EDEN_NX2_FAST_DRAW_VERIFY
+        u64 verified{};
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
+        /// StateChanged draws by the reason of the last break, and by its 3D method.
+        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+        std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        u64 window_start{};
+    };
+    struct ReusableTake {
+        GraphicsPipeline* pipeline{}; ///< null: resolve the draw in full
+        bool delta{};                 ///< light changes since: ConfigureDelta
+        bool vertex_buffers{};        ///< a delta draw binds the vertex buffers again
+    };
+    /// The pipeline the draw can reuse with what the previous draw bound, if any.
+    ReusableTake TakeReusableDraw(bool is_indexed, bool is_indirect);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect);
+    void ReportFastDraws();
+    ReusableDraw reusable_draw;
+    FastDrawStats fast_draw_stats;
+
+    enum CleanCache : size_t { CleanTextures, CleanQueries, CleanShaders, CleanCount };
+    std::array<VideoCommon::Nx2CleanPages, CleanCount> clean_pages{};
+    struct SkipStats {
+        u64 window_start{};
+        u64 ranges{};
+        std::array<u64, CleanCount> ranges_skipped{};
+        std::array<u64, CleanCount> invalidation_mismatches{};
+        u64 dynamic_states{};
+        u64 dynamic_skipped{};
+        u64 dynamic_mismatches{};
+        u64 dynamic_pipeline_mismatches{};
+    };
+    SkipStats skip_stats;
+    Tegra::Engines::Maxwell3D::DirtyState::Flags dynamic_state_flags;
+    void ReportSkips();
 
     struct IndirectTrace {
         vk::Buffer readback;

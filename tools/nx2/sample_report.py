@@ -85,8 +85,9 @@ def is_exe(path, exe_name):
 class Symbolizer:
     """Maps lichii.exe RVAs to function names (innermost inline frame first)."""
 
-    def __init__(self, exe, cache_path, symbolizer="llvm-symbolizer"):
+    def __init__(self, exe, cache_path, symbolizer="llvm-symbolizer", inlines=True):
         self.exe = exe
+        self.inlines = inlines
         self.cache_path = cache_path
         self.symbolizer = symbolizer
         self.cache = {}
@@ -110,8 +111,8 @@ class Symbolizer:
             for start in range(0, len(missing), 4096):
                 batch = missing[start:start + 4096]
                 output = subprocess.run(
-                    [self.symbolizer, "--obj=" + self.exe, "--relative-address", "--inlines",
-                     "--output-style=JSON"],
+                    [self.symbolizer, "--obj=" + self.exe, "--relative-address",
+                     "--inlines" if self.inlines else "--no-inlines", "--output-style=JSON"],
                     input="\n".join("%#x" % rva for rva in batch), capture_output=True, text=True,
                     check=True).stdout
                 lines = [line for line in output.splitlines() if line.strip()]
@@ -245,6 +246,9 @@ def main():
     parser.add_argument("samples")
     parser.add_argument("--exe", default="lichii.exe", help="lichii.exe of the build (lichii.pdb next to it)")
     parser.add_argument("--symbolizer", default="llvm-symbolizer")
+    parser.add_argument("--no-inlines", action="store_true",
+                        help="attribute samples to the real (not inlined) functions; MSVC's inline "
+                             "records can name the wrong callers")
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--paths", type=int, default=30)
     parser.add_argument("--folded", help="write folded stacks (flamegraph.pl input)")
@@ -256,7 +260,9 @@ def main():
     if not sample_file.complete:
         print("note: the file ends without its end record (cut short)", file=sys.stderr)
     symbolizer = Symbolizer(args.exe if os.path.exists(args.exe) else None,
-                            args.samples + ".symcache.json", args.symbolizer)
+                            args.samples + (".symcache-noinl.json" if args.no_inlines
+                                            else ".symcache.json"),
+                            args.symbolizer, not args.no_inlines)
     stacks = symbolize_samples(sample_file, os.path.basename(args.exe), symbolizer)
     threads = summarize(stacks)
     report(threads, sample_file.hz, args.top, args.paths)

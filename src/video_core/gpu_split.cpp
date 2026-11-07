@@ -30,6 +30,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -162,6 +163,9 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_memory_writer_position = 0;
+    pending_write_count = 0;
+    async_writes.clear();
     last_sync_position = 0;
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
@@ -270,6 +274,7 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -284,6 +289,104 @@ void GpuSplit::Drain(DrainSite site) {
 
 bool GpuSplit::WaitForWriters() {
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+}
+
+bool GpuSplit::WaitForMemoryWriters() {
+    const u64 target = (std::max)(last_writer_position, last_memory_writer_position);
+    return WaitFor((std::min)(target, write_position), DrainSite::MacroDmaRead);
+}
+
+bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    u64 target = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            target = (std::max)(target, write.position);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        return false;
+    }
+    if (target != 0) {
+        WaitFor(target, DrainSite::MacroDmaRead);
+    }
+    return true;
+}
+
+bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            return false;
+        }
+        if (write.begin < end && begin < write.end) {
+            return true;
+        }
+    }
+    return remembered == pending_writes.size();
+}
+
+bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
+    if ((begin & 3) != 0) {
+        return false;
+    }
+    const u64 end = begin + u64{words} * sizeof(u32);
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    // Newest first, back to what the back had consumed before guest memory was read.
+    std::array<u32, 64> overlapping;
+    u32 found = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const PendingWrite& write = pending_writes[index];
+        if (write.position <= since) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
+                // EDEN_NX2_OVERLAY_TRACE: which queued writes keep reads waiting.
+                static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+                static std::atomic<u32> traced{};
+                if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                    LOG_INFO(HW_GPU, "overlay: read {:#x}+{} blocked by {} write {:#x}-{:#x}",
+                             begin, words * 4, write.what, write.begin, write.end);
+                }
+                return false;
+            }
+            overlapping[found++] = static_cast<u32>(index);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+        static std::atomic<u32> traced{};
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(HW_GPU, "overlay: read {:#x} with over {} queued writes", begin,
+                     pending_writes.size());
+        }
+        return false;
+    }
+    for (u32 i = found; i-- > 0;) {
+        const PendingWrite& write = pending_writes[overlapping[i]];
+        for (u32 w = 0; w < write.words; ++w) {
+            const u64 address = write.begin + u64{w} * sizeof(u32);
+            if (address >= begin && address < end) {
+                out[(address - begin) / sizeof(u32)] = write.data[w];
+            }
+        }
+    }
+    return true;
 }
 
 bool GpuSplit::WaitForSync() {
@@ -327,7 +430,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
             return;
         }
     }
-    if (ranged_writes.size() == MaxRangedWrites) {
+    if (ranged_writes.size() >= MaxRangedWrites()) {
         // Too many in flight: the oldest counts for every read again.
         const RangedWrite& oldest = ranged_writes.front();
         if (oldest.position > last_memory_write_position) {
@@ -375,19 +478,46 @@ u64 GpuSplit::MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& ta
     }
     u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
     target_method = last_memory_write_method;
-    for (const RangedWrite& write : ranged_writes) {
-        if (write.begin < end && begin < write.end && write.position > target) {
-            target = write.position;
-            target_method = write.method;
+    // Newest first (positions rise along the deque): the first overlap is the target, and the
+    // writes before `target` can't raise it.
+    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > target;
+         ++it) {
+        if (it->begin < end && begin < it->end) {
+            target = it->position;
+            target_method = it->method;
+            break;
         }
     }
     return std::min(target, write_position);
+}
+
+size_t GpuSplit::MaxRangedWrites() {
+    // 256 overflowed in Ocarina of Time (thousands of constant buffer uploads a frame): the
+    // oldest then counted for every semaphore acquire and macro memory read, which waited for
+    // the back to reach it.
+    static const size_t max = [] {
+        const char* const value = std::getenv("EDEN_NX2_RANGED_MAX");
+        return value != nullptr ? (std::max<size_t>)(std::strtoull(value, nullptr, 10), 1) : 256;
+    }();
+    return max;
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
     const u64 done = consumed.load(std::memory_order_acquire);
     u32 method{};
     return MemoryWriterTarget(done, begin, end, method) > done;
+}
+
+u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
+    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 target = MemoryWriterTarget(done, begin, end, method);
+    if (target <= done) {
+        return 0;
+    }
+    return target == last_writer_position         ? 1
+           : target == last_sync_position         ? 2
+           : target == last_memory_write_position ? 3
+                                                  : 4;
 }
 
 void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload, ReleaseKind kind) {
@@ -540,6 +670,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -668,6 +799,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         if (engine->fast_maxwell3d) {
             // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
             // virtual call.
@@ -741,6 +875,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -751,6 +888,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
@@ -821,6 +961,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+    Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     Common::SetCurrentThreadToPerformanceCores();
     system->RegisterHostThread();
 #ifdef _WIN32

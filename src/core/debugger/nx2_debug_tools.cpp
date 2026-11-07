@@ -18,6 +18,7 @@
 #include "common/scope_exit.h"
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
+#include "common/nx2_timeline.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -379,6 +380,46 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+// Records what the emulator's threads do and wait for (common/nx2_timeline.h) and returns once
+// the Chrome trace is written.
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
+// Writes the instrumented build's profile now (clang -fprofile-instr-generate builds only): it is
+// otherwise written at a clean exit, which a training run can't always get.
+json PgoDump(ToolState&, const json&) {
+#if defined(__LLVM_INSTR_PROFILE_GENERATE)
+    return {{"written", __llvm_profile_write_file() == 0}};
+#else
+    throw std::runtime_error{"not an instrumented (-fprofile-instr-generate) build"};
+#endif
+}
+
+json Timeline(ToolState& state, const json& params) {
+    const double seconds = Param<double>(params, "seconds", 5.0, 0.1, 30.0);
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const auto path = state.dump_directory / fmt::format("timeline_{}.json", stamp);
+    if (!Common::Nx2Timeline::Start(path, seconds, params.value("detail", false))) {
+        throw std::runtime_error{"a timeline recording is already running"};
+    }
+    const std::string expected = Common::FS::PathToUTF8String(path);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds + 30.0);
+    while (Common::Nx2Timeline::LastFile() != expected) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            throw std::runtime_error{"the timeline was not written in time"};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    std::error_code error;
+    return {{"file", expected},
+            {"seconds", seconds},
+            {"bytes", std::filesystem::file_size(path, error)}};
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -388,6 +429,19 @@ json SampleThreads(ToolState& state, const json& params) {
     std::string report = Nx2Sampler::Sample(threads.c_str(), seconds, path.string());
     report.resize((std::min)(report.size(), Param<size_t>(params, "max_chars", 60000, 0, 4000000)));
     return {{"file", path.generic_string()}, {"report", std::move(report)}};
+}
+
+json SetSwitch(ToolState&, const json& params) {
+    const std::string name = params.at("name").get<std::string>();
+    auto* const value = VideoCore::Nx2Debug::FindSwitch(name);
+    if (value == nullptr) {
+        throw std::runtime_error{fmt::format("unknown live switch {}", name)};
+    }
+    const int previous = value->load(std::memory_order_relaxed);
+    if (params.contains("value")) {
+        value->store(params.at("value").get<int>(), std::memory_order_relaxed);
+    }
+    return {{"name", name}, {"previous", previous}, {"value", value->load()}};
 }
 
 json ReadMemory(ToolState& state, const json& params) {
@@ -583,6 +637,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
+        {"timeline", handler(Timeline)},
+        {"pgo_dump", handler(PgoDump)},
+        {"switch", handler(SetSwitch)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},

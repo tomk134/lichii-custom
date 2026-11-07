@@ -374,6 +374,8 @@ private slots:
     void OnMenuInstallToNAND();
     void OnMenuRecentFile();
     void OnConfigure();
+    /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
+    void AskOotFrameRate();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();
@@ -383,6 +385,7 @@ private slots:
     void OnTasReset();
     void OnToggleGraphicsAPI();
     void OnToggleDockedMode();
+    void OnToggleOotFrameRate();
     void OnToggleGpuAccuracy();
     void OnToggleAdaptingFilter();
     void OnConfigurePerGame();
@@ -455,6 +458,7 @@ private:
                            std::string_view gpu_vendor = {});
     void OnApplicationChanged(u64 program_id);
     void UpdateDockedButton();
+    void UpdateOotFpsButton();
     void UpdateAPIText();
     void UpdateFilterText();
     void UpdateAAText();
@@ -536,6 +540,7 @@ private:
     QPushButton* renderer_status_button = nullptr;
     QPushButton* refresh_button = nullptr;
     QPushButton* dock_status_button = nullptr;
+    QPushButton* oot_fps_button = nullptr;
     QPushButton* filter_status_button = nullptr;
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
@@ -549,6 +554,7 @@ private:
 
     UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
+    bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
