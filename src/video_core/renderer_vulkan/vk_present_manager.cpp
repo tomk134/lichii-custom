@@ -404,11 +404,14 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     using Clock = std::chrono::steady_clock;
     pacer.NoteQueued(frame->queued_at);
     const VkPresentModeKHR mode = swapchain.PresentMode();
+    // Not for a game whose presents are not paced (no frame period to lock to): holding its
+    // frames to refreshes would be a frame rate cap.
     const bool allowed =
         (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR ||
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
         !Settings::values.frame_gen.GetValue() && Settings::values.use_speed_limit.GetValue() &&
-        Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
+        Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo &&
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed) > 0;
     pacer.Refresh(Clock::now(), allowed);
     if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
         // The next target counts from the refresh the previous frame was shown at.

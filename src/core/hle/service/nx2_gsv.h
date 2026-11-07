@@ -1985,17 +1985,27 @@ private:
         // Ocarina of Time's 30 FPS mode (lower-end PCs): two vblanks a frame. Its frame step
         // follows the time measured (Dynamic FPS by Dark), so it keeps full speed.
         constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-        if (process != nullptr && process->GetProgramId() == OcarinaOfTimeId &&
-            Settings::values.oot_30fps.GetValue()) {
+        const bool ocarina = process != nullptr && process->GetProgramId() == OcarinaOfTimeId;
+        if (ocarina && Settings::values.oot_30fps.GetValue()) {
             swap_interval = (std::max)(swap_interval, 2U);
         }
+        // Ocarina's 60 FPS mode presents unpaced: its frame step follows real time (Dynamic FPS),
+        // so holding each present to a 60 Hz vblank only capped the frame rate at 60. The host
+        // frame pacer follows (vk_present_manager.cpp PaceFrame). EDEN_NX2_OOT_PACE=1 paces as
+        // before.
+        static const bool oot_pace = [] {
+            const char* value = std::getenv("EDEN_NX2_OOT_PACE");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool unpaced = ocarina && !oot_pace && !Settings::values.oot_30fps.GetValue();
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (trace) {
             m_frame_trace.interval = swap_interval;
             m_frame_trace.refresh = refresh_rate;
             m_frame_trace.forced = forced_interval;
         }
-        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+        if (unpaced || !Settings::values.use_speed_limit.GetValue() ||
+            Settings::SpeedLimit() == 0) {
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
