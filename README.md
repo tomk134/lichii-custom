@@ -5,7 +5,8 @@ Time on Switch 2 (`0400486024DEC000`), on top of the [Frizti v3](https://github.
 The upstream README is in [README.upstream.md](README.upstream.md).
 
 > [!IMPORTANT]
-> No game files, keys or firmware are included. You need your own dump of the game and your own keys.
+> No game files are included: you need your own dump of the game. A `.nup` dump needs **no keys and
+> no firmware**: the emulator supplies the firmware it needs.
 > Tested on one PC only (Ryzen 7 9800X3D, RTX 5070 Ti, Windows 11). It tries to work everywhere, but
 > AMD and Intel GPUs and slower CPUs have not been tested. Report problems as issues, with your
 > `eden_log.txt`.
@@ -15,7 +16,7 @@ The upstream README is in [README.upstream.md](README.upstream.md).
 1. Download `Lichii-custom-Windows-x64.zip` from the [latest release](../../releases/latest) and unpack it.
 2. If Windows says a DLL is missing, install the
    [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
-3. Run `lichii.exe`. Settings, keys, saves and games from Lichii, Eden or another Frizti build are used
+3. Run `lichii.exe`, then **File > Load File** and pick your `.nup` (or add its folder to the game list). Settings, keys, saves and games from Lichii, Eden or another Frizti build are used
    as they are (`%APPDATA%\eden`).
 4. When it asks for Ocarina's frame rate, pick **60 FPS** (30 FPS is for slow PCs).
 
