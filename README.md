@@ -1,8 +1,9 @@
 # Lichii custom (Ocarina of Time performance build)
 
-A performance build of [Lichii](https://github.com/zortos293/Lichii) for The Legend of Zelda: Ocarina of
-Time on Switch 2 (`0400486024DEC000`), on top of the [Frizti v3](https://github.com/Frizti/Lichii) fork.
-The upstream README is in [README.upstream.md](README.upstream.md).
+A performance build based on [Lichii](https://github.com/zortos293/Lichii), for The Legend of Zelda:
+Ocarina of Time on Switch 2 (`0400486024DEC000`). It includes work from the
+[Frizti](https://github.com/Frizti/Lichii) fork. The upstream README is in
+[README.upstream.md](README.upstream.md).
 
 > [!IMPORTANT]
 > No game files are included: you need your own dump of the game. A `.nup` dump needs **no keys and
